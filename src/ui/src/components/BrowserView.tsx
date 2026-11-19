@@ -317,9 +317,9 @@ export const BrowserView = () => {
             alt="Browser frame"
           />
         ) : (
-          <div style={{ textAlign: "center", color: "#ccc" }}>
+          <div style={{ textAlign: "center", color: "#64748b" }}>
             <Globe size={40} style={{ marginBottom: "8px", opacity: 0.1 }} />
-            <div style={{ fontSize: "11px", fontWeight: 500, opacity: 0.3 }}>
+            <div style={{ fontSize: "11px", fontWeight: 500 }}>
               {isRunning ? 'WAITING FOR RENDER...' : selectedStep ? 'No captured screen for this step.' : 'No browser screen captured for this test.'}
             </div>
           </div>

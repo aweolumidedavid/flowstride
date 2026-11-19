@@ -1,9 +1,14 @@
+import { RunHistoryView } from './views/RunHistoryView';
 import { useEffect, useState } from "react";
 import Home from "./Home";
 import { connectToRunner, disconnectRunner } from "./socket";
 import init, { get_engine_version } from "workspace_engine";
 
 export default function App() {
+  return window.location.pathname === '/run-reports' ? <RunHistoryView /> : <RunnerApp />;
+}
+
+function RunnerApp() {
   const [engineStatus, setEngineStatus] = useState<string>(
     "Initialising Native Engine...",
   );

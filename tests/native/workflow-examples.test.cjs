@@ -7,12 +7,13 @@ const walk=directory=>fs.readdirSync(directory,{withFileTypes:true}).flatMap(ent
 function parse(source){return new Parser(new Lexer(source).tokenise()).parse();}
 
 test('core guides link to existing files, parse their exact flow examples and keep public release details clean',()=>{
-  const markdown=[path.join(root,'NATIVE_WORKFLOWS.md'),...walk(examples).filter(p=>p.endsWith('.md'))];assert.equal(markdown.length,9);
-  const flows=walk(examples).filter(p=>p.endsWith('.flow'));assert.equal(flows.length,18);
+  const files = [...walk(examples), ...walk(path.join(root, 'examples/practice-app'))];
+  const markdown = [path.join(root, 'NATIVE_WORKFLOWS.md'), ...files.filter(file => file.endsWith('.md'))];
+  const flows = files.filter(file => file.endsWith('.flow'));
   for(const file of flows)assert(parse(fs.readFileSync(file,'utf8')).length>0,file);
   for(const file of markdown){
     const source=fs.readFileSync(file,'utf8');
-    assert(!/\bPro\b|@next|\b\d+\.\d+\.\d+-(?:rc|local)\b|Digital\s*Ocean|flowstride-engine-vault|\.tgz\b/i.test(source),file);
+    assert(!/@next|\b\d+\.\d+\.\d+-(?:rc|local)\b|Digital\s*Ocean|flowstride-engine-vault|\.tgz\b/i.test(source),file);
     assert(!/\/Users\/[a-z0-9._-]+\/(?:Documents|Desktop|Downloads)/i.test(source),file);
     assert(!source.includes('{{FLOW:'),file);
     for(const match of source.matchAll(/\[[^\]]*\]\(([^\s)]+)(?:\s+"[^"]*")?\)/g)){

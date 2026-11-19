@@ -63,7 +63,14 @@ export interface TestScenario {
   steps: TestStep[];
 }
 
+export interface DependencyState {
+  status: 'waiting' | 'blocked';
+  reason: string;
+}
+
 interface AppState {
+  dependencyStates: Partial<Record<string, DependencyState>>;
+  setDependencyState: (payload: unknown) => void;
   browserInfo: Record<string, { engine: string; version: string; headless: boolean }>;
   setBrowserInfo: (fileName: string, info: { engine: string; version: string; headless: boolean }) => void;
   pendingPauses: Record<string, ExecutionPause>;
@@ -89,6 +96,8 @@ interface AppState {
   selectedLogId: string | null;
 
   logs: LogEvent[];
+  recordedVideos: string[];
+  addRecordedVideo: (fileName: string) => void;
   networkLogs: any[];
   assertions: any[];
   activeReplay: ReplayState | null;
@@ -127,6 +136,19 @@ interface AppState {
 }
 
 export const useFlowStore = create<AppState>((set) => ({
+  dependencyStates: {},
+  setDependencyState: (payload: unknown) => set(state => {
+    if (!payload || typeof payload !== 'object') return state;
+    const { fileName, status, reason } = payload as Record<string, unknown>;
+    if (typeof fileName !== 'string' || !fileName || fileName.length > 4096) return state;
+    if (status === 'ready') {
+      const dependencyStates = { ...state.dependencyStates };
+      delete dependencyStates[fileName];
+      return { dependencyStates };
+    }
+    if ((status !== 'waiting' && status !== 'blocked') || typeof reason !== 'string') return state;
+    return { dependencyStates: { ...state.dependencyStates, [fileName]: { status, reason: reason.slice(0, 4096) } } };
+  }),
   pendingPauses: {},
   pauseExecution: payload => set(state => {
     const pause = executionPause(redactWorkerPayload('EXECUTION_PAUSED', payload, []));
@@ -158,6 +180,9 @@ export const useFlowStore = create<AppState>((set) => ({
   activeNetworkTab: "REST",
   selectedLogId: null,
   logs: [],
+  recordedVideos: [],
+  addRecordedVideo: (fileName) => set((state) => state.recordedVideos.includes(fileName)
+    ? state : { recordedVideos: [...state.recordedVideos, fileName] }),
   networkLogs: [],
   assertions: [],
   activeReplay: null,
@@ -223,6 +248,7 @@ export const useFlowStore = create<AppState>((set) => ({
 
   startExecution: () =>
     set({
+      dependencyStates: {},
       pendingPauses: {},
       isRunning: true,
       runStatus: "running",
@@ -231,6 +257,7 @@ export const useFlowStore = create<AppState>((set) => ({
       activeStepId: null,
       historicalStepIds: {},
       logs: [],
+      recordedVideos: [],
       networkLogs: [],
       assertions: [],
       testScenarios: [],
@@ -396,18 +423,8 @@ export const useFlowStore = create<AppState>((set) => ({
           attemptHistory: history,
         };
 
-        const hasFailed = updatedSteps.some((s) => s.status === "failed");
-        const allPassed = aggregateStepStatus(updatedSteps) === "passed";
-
-        let newScenarioStatus = scenario.status;
-        if (hasFailed) newScenarioStatus = "failed";
-        else if (allPassed) newScenarioStatus = "pass";
-
-        return {
-          ...scenario,
-          status: newScenarioStatus,
-          steps: updatedSteps,
-        };
+        // Steps arrive one at a time. The runner reports the scenario outcome after cleanup.
+        return { ...scenario, steps: updatedSteps };
       });
 
       if (!updated) return state;

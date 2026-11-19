@@ -5,6 +5,8 @@ import { projectPath } from '../utils/projectPaths';
 import { cloudApiBase, cloudFailure, cloudFetch } from '../utils/cloud';
 import { loadCloudEnvironment, cloudSessionDescription, tokenExpiryDescription } from './utils/cloudSession';
 import { loadNativeConfig } from '../ci/config';
+import { practiceTarget } from '../practice/project';
+import { installBrowsers } from './utils/install_browsers';
 import { initCI } from '../ci/init';
 import { Command } from "commander";
 import { runAction } from "./commands/run";
@@ -21,7 +23,7 @@ import ora from "ora";
 
 const program = new Command();
 program.hook('preAction', (_program, command) => {
-  if (['login', 'status', 'run', 'update'].includes(command.name())) {
+  if (['login', 'status', 'update'].includes(command.name())) {
     API_BASE = loadCloudEnvironment(process.cwd(), command.opts().env);
   }
 });
@@ -35,9 +37,10 @@ program
 
 program
   .command("init")
-  .description("Initialise a new Flowstride workspace in the current directory")
-  .action(async () => {
-    await initAction();
+  .description('Initialise a new Flowstride workspace in the current directory')
+  .option('--practice', 'Add a separate practice workspace to an existing project')
+  .action(async (options: { practice?: boolean }) => {
+    await initAction(options);
   });
 
 program
@@ -353,6 +356,14 @@ program
       }
 
       if (options.ci) process.env.FLOWSTRIDE_NATIVE_CI = '1';
+      if (options.headed) options.headless = false;
+      const root = process.cwd();
+      const practice = practiceTarget(root, targetPath, loadNativeConfig(root, options));
+      if (practice) {
+        await runAction(practice, { ...options, forceOS: true }, true);
+        return;
+      }
+      API_BASE = loadCloudEnvironment(root, options.env);
       console.log(cloudSessionDescription(API_BASE));
       let token = process.env.FLOWSTRIDE_TOKEN?.trim() || null;
       let forceOS = false;
@@ -464,10 +475,6 @@ program
         }
       }
 
-      if (options.headed) {
-        options.headless = false;
-      }
-
       const resolvedTargetPath = targetPath || loadNativeConfig(process.cwd(), options).testDir!;
       const strictUiFlowsDir = path.resolve(process.cwd(), resolvedTargetPath);
 
@@ -519,9 +526,11 @@ async function handleOfflinePrompt(): Promise<boolean> {
 
 program
   .command("report")
-  .description("Launch the interactive Debug Dashboard")
-  .action(async () => {
-    await reportAction();
+  .description('Open saved Flowstride and Playwright runs')
+  .option('--no-open', 'Print the report URL without launching the browser')
+  .option('--legacy', 'Open the legacy execution report')
+  .action(async options => {
+    await reportAction(options);
   });
 
 program
@@ -537,8 +546,7 @@ program.command('install')
   .option('--with-deps', 'Install operating-system browser dependencies')
   .action((browsers: string[], options: { withDeps?: boolean }) => {
     if (browsers.some(browser => !['chromium','firefox','webkit'].includes(browser))) throw new Error('Unknown browser.');
-    const { execFileSync } = require('node:child_process');
-    execFileSync(process.execPath, [path.join(path.dirname(require.resolve('playwright/package.json')), 'cli.js'), 'install', ...(options.withDeps ? ['--with-deps'] : []), ...(browsers.length ? browsers : ['chromium'])], { stdio: 'inherit', env: { ...process.env, PLAYWRIGHT_SKIP_BROWSER_GC: '1' } });
+    installBrowsers(browsers.length ? browsers : ['chromium'], options.withDeps);
     console.log(`[Browsers]: Matching binaries installed: ${(browsers.length ? browsers : ['chromium']).join(', ')}. Use run --browser <engine> to select one.`);
   });
 

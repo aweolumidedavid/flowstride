@@ -21,9 +21,11 @@ export const FlowList = () => {
     isRunning,
   } = useFlowStore();
 
-  const fileList = Array.from(
-    new Set(testScenarios.map((s) => s.fileName)),
-  ).filter(Boolean);
+  const dependencyStates = useFlowStore((state) => state.dependencyStates);
+  const fileList = Array.from(new Set([
+    ...testScenarios.map(scenario => scenario.fileName),
+    ...Object.keys(dependencyStates),
+  ])).filter(Boolean);
 
   const [expandedFile, setExpandedFile] = useState<string | null>(null);
   const [expandedBlocks, setExpandedBlocks] = useState<Record<string, boolean>>(
@@ -55,7 +57,7 @@ export const FlowList = () => {
   const total = fileList.length;
   const fileStatuses = new Map(fileList.map(fileName => [
     fileName,
-    aggregateFileStatus(testScenarios.filter(scenario => scenario.fileName === fileName)),
+    dependencyStates[fileName]?.status || aggregateFileStatus(testScenarios.filter(scenario => scenario.fileName === fileName)),
   ]));
   const passed = [...fileStatuses.values()].filter(status => status === "passed").length;
   const failed = [...fileStatuses.values()].filter(status => status === "failed").length;
@@ -77,6 +79,7 @@ export const FlowList = () => {
         return <CheckCircle2 size={size} color="#34d399" />;
       case "failed":
         return <XCircle size={size} color="#f87171" />;
+      case "waiting":
       case "running":
         return <Loader2 size={size} color="#60a5fa" className="animate-spin" />;
       case "skipped":
@@ -235,6 +238,7 @@ export const FlowList = () => {
 
         {fileList.map((fileName) => {
           const isExpanded = expandedFile === fileName;
+          const dependency = dependencyStates[fileName];
 
           const fileScenarios = testScenarios.filter(
             (s) => s.fileName === fileName,
@@ -335,6 +339,13 @@ export const FlowList = () => {
                 </span>
               </div>
 
+              {dependency && (
+                <p data-flow-dependency={dependency.status} role="status"
+                  style={{ margin: '0 12px 10px 42px', color: dependency.status === 'blocked' ? '#fca5a5' : '#a5b4fc', fontSize: '12px', overflowWrap: 'anywhere' }}>
+                  {dependency.status === 'blocked' && <strong>Blocked. </strong>}
+                  {dependency.reason}
+                </p>
+              )}
               {isExpanded && (
                 <div style={{ backgroundColor: "#05070a", padding: "5px 0" }}>
                   {blocks.length > 0 ? (

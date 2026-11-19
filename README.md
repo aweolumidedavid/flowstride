@@ -16,32 +16,14 @@ Install Flowstride in your project.
 ```sh
 npm install --save-dev flowstride
 npx flowstride init
-npx flowstride run flows/example.flow
+npx flowstride run
 ```
 
 If you use VS Code, open **Extensions**, search for **Flowstride Automation**, and select **Install**. The extension adds syntax highlighting, formatting, validation, and snippets for `.flow` files. [Flowstride Automation on the Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=flowstride.flowstride-vscode)
 
-`init` creates the project folders and an example flow, and installs Chromium. You can also install the matching browser explicitly:
+On a fresh Flowstride project, `init` installs Chromium if needed and creates two starter flows in `flows/examples/starter/`. The first `run` starts the bundled practice app and opens the live dashboard for the catalog and sign-in tests. Close the dashboard or press Ctrl+C to end the session. [Practice app setup and existing-project opt-in](./examples/practice-app/README.md)
 
-```sh
-npx flowstride install
-```
-
-An example flow:
-
-```text
-Feature: Home page
-
-Scenario: Show the sign-in form
-
-Given "Open the application"
-  flow.open "https://your-application.example/login";
-
-Then "The sign-in button is visible"
-  flow.expect visible "Sign in";
-```
-
-Replace the URL and assertion with values from your own application.
+Install matching browser binaries explicitly with `npx flowstride install`.
 
 ## Workflow guides
 

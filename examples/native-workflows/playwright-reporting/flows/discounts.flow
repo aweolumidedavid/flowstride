@@ -1,0 +1,10 @@
+Feature: Catalog discounts
+import { discountedTotal } from "catalog.js";
+
+Scenario: Apply the catalog discount in cents
+  Given "The prices are in cents"
+    flow.log "Checking the catalog discount";
+  When "Apply a ten percent discount to the three prices"
+    flow.call discountedTotal([12500, 8500, 4000], 10) as "total";
+  Then "The discounted total is 225 dollars"
+    flow.assert.value {"actual":"@total","operator":"equals","expected":22500};

@@ -1,4 +1,7 @@
 export interface FlowstrideConfig {
+  protectedHandoff?: boolean;
+  /** Dashboard frames may come from the owned local practice server during this run. */
+  practiceDashboardOrigin?: string;
   /** Internal run plan: immutable dataset and fragment fingerprints, never row values. */
   nativeDataManifest?: Record<string,string>;
   scenarioTags?: string[];
@@ -20,6 +23,7 @@ export interface FlowstrideConfig {
   device?: 'desktop' | 'phone' | 'landscape';
   viewport?: { width: number; height: number };
   testDir?: string;
+  practiceApp?: boolean;
   artifactsDir?: string;
   recordVideo?: boolean;
   browserErrors?: 'fail' | 'record';
@@ -46,6 +50,7 @@ export interface FlowstrideConfig {
     evidence?: { screenshots?: boolean; cloudVideo?: boolean };
   };
   pluginsDir?: string;
+  helpersDir?: string;
 }
 
 export interface SessionData {
@@ -77,6 +82,20 @@ export interface SessionDefinition {
     onStatus: number[];
     action: (oldTokens: any) => Promise<Record<string, any>>;
   };
+}
+
+export type FixtureTeardown = (signal: AbortSignal) => void | Promise<void>;
+
+export interface FixtureContext {
+  readonly baseURL?: string;
+  /** One-based scenario attempt when using flow.fixture.use. */
+  readonly attempt?: number;
+  /** Cancels asynchronous setup when the runner stops or the setup times out. */
+  readonly signal: AbortSignal;
+  /** Register the release function immediately after acquiring a resource. */
+  defer(release: FixtureTeardown, options?: { handoff: string }): void;
+  /** Request an isolated browser profile for this scenario attempt. */
+  profile(name: string, options?: import('playwright').BrowserContextOptions): void;
 }
 
 export interface FlowstrideSDK {

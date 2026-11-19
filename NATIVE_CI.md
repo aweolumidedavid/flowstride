@@ -108,3 +108,24 @@ npx --no-install flowstride run workflow-examples/api-and-ui/flows/api-and-ui.fl
 ```
 
 In CI, `--no-install` makes a missing local Flowstride installation fail rather than fetching a package. Ordinary interactive commands use `npx flowstride`. Configure the local app through `webServer`, and exclude `negative/` examples and unconfigured service templates from your passing CI target.
+
+## Report existing Playwright Test suites
+
+Add the Flowstride reporter to your existing Playwright config. Keep your current reporters in the array if you want their output too.
+
+```javascript
+reporter: [
+  ['list'],
+  ['flowstride/playwright-reporter'],
+],
+```
+
+Run `npx playwright test` as usual. Playwright runs the specs, fixtures, browsers, workers, and retries and decides the exit status. Flowstride saves the suite outcome, test outcomes, individual attempts, and failure diagnostics. Open **Saved runs** with `npx flowstride report` from the same project directory. Use `--no-open` to print the browser URL. [Playwright reporter API](https://playwright.dev/docs/api/class-reporter), [Playwright test results](https://playwright.dev/docs/api/class-testresult)
+
+Flowstride CI runs from `npx flowstride run … --ci` appear in the same view. The reports are stored locally under `.flowstride/run-history/`. Flowstride CI evidence stays in the configured artifacts directory. Ignore `.flowstride/` in your test project to keep the saved reports out of version control.
+
+Attachments are opt-in. Add `{ attachments: ['screenshot', 'video', 'trace', 'text'] }` as the second item in the reporter entry to copy those types from completed attempts. The reporter supports PNG and JPEG screenshots, WebM and MP4 video, Playwright trace ZIPs, and UTF-8 text and JSON. Screenshot imports respect `security.evidence.screenshots`. Explicit `recordVideo: false` and `trace: false` in the Flowstride config disable those imports. Keep file-backed attachments inside the project and use Playwright’s default output retention so the files are available to the reporter. Each attachment is limited to 32 MiB, text and JSON inputs to 256 KiB, and the imported evidence for a run to 128 MiB.
+
+Failure diagnostics and text attachments pass through Flowstride's redaction. Use `redactEnv: ['QA_AUTH_VALUE']` to register the values of extra environment variables for redaction. Screenshots, videos, and traces are saved as binary downloads and may contain sensitive test data. Enable them only for suites whose evidence is safe to retain. Runtime stdout and stderr are outside this archive.
+
+The [runnable discount example](examples/native-workflows/playwright-reporting/README.md) shows how to use one JavaScript helper in a Playwright spec and a `.flow` scenario.

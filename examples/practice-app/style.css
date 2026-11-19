@@ -1,0 +1,72 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, system-ui, sans-serif;
+  color: #221936;
+  background: #f6f4fb;
+  line-height: 1.5;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+a { color: #5733a1; }
+
+.topbar {
+  background: #201337;
+  color: #fff;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 24px;
+  padding: 15px max(20px, calc((100vw - 1080px) / 2));
+}
+.topbar a { color: #fff; text-decoration: none; }
+.topbar a:hover { text-decoration: underline; }
+.brand { font-size: 1.05rem; font-weight: 750; }
+.topbar nav, .inline { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+
+main { width: min(1080px, calc(100% - 40px)); margin: 38px auto 56px; }
+h1, h2, p { margin: 0; }
+h1 { font-size: clamp(1.9rem, 4vw, 2.7rem); letter-spacing: -.04em; }
+h2 { font-size: 1.15rem; }
+p + p { margin-top: 6px; }
+label { display: block; font-size: .88rem; font-weight: 650; margin-bottom: 5px; }
+button, select, input { font: inherit; border-radius: 7px; }
+button {
+  background: #5733a1;
+  border: 1px solid #5733a1;
+  color: #fff;
+  font-weight: 650;
+  padding: 8px 13px;
+  cursor: pointer;
+}
+button:hover { background: #442480; }
+button.quiet { background: transparent; border-color: #aaa0bd; }
+input, select { background: #fff; color: inherit; border: 1px solid #a9a1b7; padding: 8px; }
+input { display: block; margin: 5px 0 16px; width: 100%; font-weight: 400; }
+:focus-visible { outline: 2px solid #9464ea; outline-offset: 3px; }
+
+.filter { margin: 20px 0; }
+.count, .car-meta, del, .member p { color: #5c536b; }
+.catalog, .members { list-style: none; padding: 0; margin: 12px 0 0; display: grid; gap: 12px; }
+.catalog { grid-template-columns: repeat(auto-fit, minmax(min(100%, 204px), 1fr)); }
+.car, .panel {
+  background: #fff;
+  border: 1px solid #e0d9ed;
+  border-radius: 12px;
+  padding: 19px;
+}
+.car-meta { display: flex; justify-content: space-between; gap: 8px; font-size: .8rem; }
+.car h2 { margin-top: 11px; }
+.price { margin-top: 4px; font-weight: 750; }
+del { font-weight: 400; margin-left: 4px; }
+.discount { font-size: .85rem; color: #145c40; font-weight: 650; }
+.narrow { max-width: 420px; margin-inline: auto; }
+.panel h1, .panel h2 { margin-bottom: 15px; }
+.notice { background: #fff1f1; color: #962e2e; border-radius: 7px; padding: 9px; margin: 12px 0; }
+.admin-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr); gap: 16px; margin-top: 16px; align-items: start; }
+.member { border-top: 1px solid #e0d9ed; padding-top: 10px; overflow-wrap: anywhere; }
+.member form { margin-top: 8px; }
+dt { font-weight: 650; }
+dd { margin-left: 0; }
+@media (max-width: 680px) { .admin-layout { grid-template-columns: 1fr; } }

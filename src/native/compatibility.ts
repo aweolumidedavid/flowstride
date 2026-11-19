@@ -94,3 +94,20 @@ export function needsNativeApplicationEvidenceProtocol(target: string, config: F
   return usesNativeCommand(target, config, step =>
     step.action === 'native' && /^(?:console|channel|visual)\./.test(step.payload.pluginMethod));
 }
+
+export function needsNativeHelperProtocol(target: string, config: FlowstrideConfig): boolean {
+  return discoverFlows(target, config.projectRoot || process.cwd()).some(file =>
+    new Lexer(fs.readFileSync(file, 'utf8')).tokenise().some(token =>
+      token.type === TokenType.IMPORT || token.type === TokenType.HELPER_CALL));
+}
+
+export function needsNativeFixtureProtocol(target: string, config: FlowstrideConfig): boolean {
+  return discoverFlows(target, config.projectRoot || process.cwd()).some(file =>
+    new Lexer(fs.readFileSync(file, 'utf8')).tokenise().some(token => !!token.fixtureScope));
+}
+
+export function needsNativeHandoffProtocol(target: string, config: FlowstrideConfig): boolean {
+  return discoverFlows(target, config.projectRoot || process.cwd()).some(file =>
+    new Lexer(fs.readFileSync(file, 'utf8')).tokenise().some(token =>
+      token.type === TokenType.ALIAS_COMMAND && /^flow\.handoff\.(?:publish|receive)$/i.test(token.value)));
+}

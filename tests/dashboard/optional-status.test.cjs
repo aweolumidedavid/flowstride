@@ -57,6 +57,18 @@ function add(id, status, file = 'optional.flow', metadata) {
   state.updateStepStatus(id, status, undefined, file, metadata);
 }
 
+test('a live file waits for its scenario result before showing Passed', () => {
+  const state = store.getState();
+  const fileStatus = () => aggregateFileStatus(store.getState().testScenarios);
+  state.startRun('admin.flow', 'Create and authorize a user');
+  add('create', 'passed', 'admin.flow');
+  assert.equal(fileStatus(), 'running');
+  add('authorize', 'passed', 'admin.flow');
+  assert.equal(fileStatus(), 'running');
+  state.scenarioResult({ fileName: 'admin.flow', scenario: 'Create and authorize a user', status: 'passed' });
+  assert.equal(fileStatus(), 'passed');
+});
+
 test('store completion and summary agree when a scenario starts with an optional skip', () => {
   const state = store.getState();
   state.startRun('optional.flow', 'Continue after optional target');

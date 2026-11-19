@@ -7,9 +7,11 @@ import type { FlowstrideConfig } from '../types';
 import { projectPath } from '../utils/projectPaths';
 import { dataSnapshot } from './paths';
 import { isSensitiveField } from '../security/sensitiveFields';
+import { variableName } from '../parser/workflow_contract';
+
+export { variableName } from '../parser/workflow_contract';
 
 export const DATA_LIMIT = 1024 * 1024;
-export const variableName = z.string().regex(/^[A-Za-z_]\w{0,127}$/).refine(value => !['__proto__','prototype','constructor','global'].includes(value), 'Choose a safe local variable name.');
 export const dataFormat = z.enum(['json','csv','text']);
 export const loadDataSchema = z.object({ file:z.string().min(1).max(4000), as:variableName, format:dataFormat.optional() }).strict();
 export const casesSchema = z.object({ file:z.string().min(1).max(4000), as:variableName.default('case'), format:z.enum(['json','csv']).optional() }).strict();

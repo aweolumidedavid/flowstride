@@ -11,20 +11,21 @@ export function isCIEnvironment() {
   return ['FLOWSTRIDE_NATIVE_CI', 'CI', 'GITHUB_ACTIONS', 'GITLAB_CI', 'CIRCLECI', 'JENKINS_URL', 'FLOWSTRIDE_API_KEY']
     .some(key => !!process.env[key] && process.env[key] !== 'false' && process.env[key] !== '0');
 }
-export function loadNativeConfig(root: string, options: Record<string, any>): FlowstrideConfig {
+export function loadNativeConfig(root: string, options: Record<string, any>, defaults: { retries?: number } = {}): FlowstrideConfig {
   const file = projectPath(root, options.config || 'flowstride.config.json');
   let input: any = {};
   if (fs.existsSync(file)) {
     input = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Flowstride configuration must be an object.');
   } else if (options.config) throw new Error(`Configuration not found: ${file}`);
-  const config: any = { ...input, browser: options.browser ?? input.browser ?? "chromium", retries: input.retries ?? 0, shard: options.shard ?? input.shard, shardHistory: options.shardHistory ?? input.shardHistory, updateBaselines: !!options.updateBaselines, projectRoot: path.resolve(root), timeout: input.timeout ?? 30000, headless: input.headless ?? true,
+  const config: any = { ...input, browser: options.browser ?? input.browser ?? "chromium", retries: input.retries ?? defaults.retries ?? 0, shard: options.shard ?? input.shard, shardHistory: options.shardHistory ?? input.shardHistory, updateBaselines: !!options.updateBaselines, projectRoot: path.resolve(root), timeout: input.timeout ?? 30000, headless: input.headless ?? true,
     ci: !!options.ci || isCIEnvironment(), bail: options.bail || input.bail || false, device: options.device ?? input.device ?? 'desktop',
     artifactsDir: input.artifactsDir ?? 'flowstride-artifacts', testDir: input.testDir ?? 'flows',
     defaultDialogBehavior: input.defaultDialogBehavior ?? 'dismiss',
     recordVideo: input.recordVideo ?? true, browserErrors: input.browserErrors ?? 'fail',
     isCloudSyncActive: options.isCloudSyncActive ?? false, machineToken: options.machineToken ?? null,
     workspaceId: options.workspaceId ?? null, manifest: options.manifest ?? null };
+  delete config.practiceDashboardOrigin;
   if (!['chromium','firefox','webkit'].includes(config.browser)) throw new Error('browser must be chromium, firefox, or webkit.');
   config.browserOptions = validateContextOptions(input.browserOptions, config.browser, root);
   if (!Number.isSafeInteger(config.retries) || config.retries < 0 || config.retries > 10) throw new Error('retries must be an integer from 0 to 10.');
@@ -40,9 +41,9 @@ export function loadNativeConfig(root: string, options: Record<string, any>): Fl
   if (process.env.BASE_URL) config.baseUrl = process.env.BASE_URL;
   if (!Number.isSafeInteger(config.timeout) || config.timeout < 1) throw new Error('timeout must be a positive integer.');
   if (!['desktop', 'phone', 'landscape'].includes(config.device)) throw new Error('device must be desktop, phone, or landscape.');
-  for (const key of ['headless','recordVideo','bail']) if (config[key] !== undefined && typeof config[key] !== 'boolean') throw new Error(`${key} must be boolean.`);
+  for (const key of ['headless','recordVideo','bail','practiceApp']) if (config[key] !== undefined && typeof config[key] !== 'boolean') throw new Error(`${key} must be boolean.`);
   if (!['fail','record'].includes(config.browserErrors)) throw new Error('browserErrors must be fail or record.');
-  for (const key of ['artifactsDir','testDir','pluginsDir']) {
+  for (const key of ['artifactsDir','testDir','pluginsDir','helpersDir']) {
     if (config[key] === undefined) continue;
     if (typeof config[key] !== 'string' || !config[key].trim()) throw new Error(`${key} must be a nonempty path.`);
     const resolved = projectPath(root, config[key]);

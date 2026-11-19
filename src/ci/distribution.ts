@@ -1,3 +1,5 @@
+import type { HandoffStatus } from '../runner/handoff_coordinator';
+import { buildHandoffPlan, handoffGroups } from '../native/handoff_plan';
 import { isWorkflowToken, prepareWorkflowFeatures } from '../native/workflow_plan';
 import { Parser } from '../parser/parser';
 import { Lexer, TokenType } from '../parser/lexer';
@@ -5,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import type { FlowstrideConfig } from '../types';
+import type { FixtureCleanupResult } from './runtime';
 import { discoverFlows, flowIdentity, projectPath } from '../utils/projectPaths';
 export function parseShard(value?: string) {
   if (value === undefined) return { index: 1, total: 1 };
@@ -20,13 +23,14 @@ export function executionPlan(target: string, config?: FlowstrideConfig) {
   const planConfig: FlowstrideConfig = config || { projectRoot: root, headless: true, timeout: 30000 };
   const files: string[] = [];
   const flowHashes: string[][] = [];
-  const flowRoot = fs.statSync(target).isDirectory() ? target : path.dirname(target);
+  const handoff = buildHandoffPlan(target, available, planConfig);
+  const flowRoot = handoff?.root ?? (fs.statSync(target).isDirectory() ? target : path.dirname(target));
   const shard = parseShard(config?.shard);
   const identity = (file: string) => flowIdentity(file, flowRoot);
-  for (const file of available) {
+  for (const file of handoff ? handoff.jobs.map(job => job.file) : available) {
     const bytes = fs.readFileSync(file);
     const content = bytes.toString('utf8');
-    if (planConfig.scenarioTags?.length || /flow\.(?:data\.cases|call|skipIf|cleanup\.register)|^\s*Tags:/im.test(content)) {
+    if (!handoff && (planConfig.scenarioTags?.length || /flow\.(?:data\.cases|call|fixture\.|skipIf|cleanup\.register)|^\s*Tags:/im.test(content))) {
       const tokens = new Lexer(content).tokenise();
       const hasPlanningCommands = tokens.some(token => isWorkflowToken(token) ||
         token.type === TokenType.ALIAS_COMMAND && token.value.toLowerCase() === 'flow.data.cases');
@@ -50,14 +54,19 @@ export function executionPlan(target: string, config?: FlowstrideConfig) {
     history = JSON.parse(fs.readFileSync(projectPath(root, config.shardHistory), 'utf8'));
     if (!history || Array.isArray(history) || typeof history !== 'object' || Object.values(history).some(value => typeof value !== 'number' || !Number.isFinite(value) || value < 0)) throw new Error('Shard history must map file names to nonnegative durations.');
   }
-  const setup = files.filter(file => file.endsWith('.first.flow'));
-  const standard = files.filter(file => !file.endsWith('.first.flow'));
+  const groups = handoff ? handoffGroups(handoff.jobs) : files.map(file => [file]);
+  const outputs = new Set(handoff?.jobs.filter(job => job.publishes.length || job.receives.length).map(job => job.file));
+  const setup = files.filter(file => file.endsWith('.first.flow') && !outputs.has(file));
+  const setupSet = new Set(setup);
   const bins: string[][] = Array.from({ length: shard.total }, () => []), weights = bins.map(() => 0);
-  for (const file of [...standard].sort((a,b) => (history[identity(b)] ?? 1) - (history[identity(a)] ?? 1) || identity(a).localeCompare(identity(b)))) {
-    const index = weights.indexOf(Math.min(...weights)); bins[index].push(file); weights[index] += history[identity(file)] ?? 1;
+  const distributed = groups.filter(group => !setupSet.has(group[0]!)).map(group => ({
+    group, weight: group.reduce((weight, file) => weight + (history[identity(file)] ?? 1), 0),
+  })).sort((a,b) => b.weight - a.weight || identity(a.group[0]!).localeCompare(identity(b.group[0]!)));
+  for (const { group, weight } of distributed) {
+    const index = weights.indexOf(Math.min(...weights)); bins[index].push(...group); weights[index] += weight;
   }
   const assigned = new Set([...setup, ...bins[shard.index - 1]!]);
-  return { files: files.filter(file => assigned.has(file)), allFiles: files.map(identity), setupFiles: setup.map(identity), suiteHash, configHash, shard, flowRoot };
+  return { files: files.filter(file => assigned.has(file)), allFiles: files.map(identity), setupFiles: setup.map(identity), suiteHash, configHash, shard, flowRoot, handoffs: handoff?.jobs.filter(job => assigned.has(job.file)) };
 }
 export function mergeResults(summaries: string[], output = 'flowstride-merged') {
   const root = process.cwd(), out = projectPath(root, output);
@@ -68,6 +77,8 @@ export function mergeResults(summaries: string[], output = 'flowstride-merged') 
   if (first.protocol !== 1 || !first.distribution?.suiteHash) throw new Error('Only native distributed reports can be merged.');
   const total = first.distribution.shard.total, seen = new Set<number>(), seenFiles = new Set<string>(), setup = new Set<string>(first.distribution.setupFiles);
   const errors: string[] = [], steps: any[] = [], attempts: any[] = [], timings: Record<string,number> = {};
+  const dependencies: (HandoffStatus & { shard: number })[] = [];
+  const fixtureCleanups: (FixtureCleanupResult & { shard: number })[] = [];
   for (const { report } of inputs) {
     const dist = report.distribution;
     if (report.protocol !== 1 || report.engine !== first.engine || !dist || dist.suiteHash !== first.distribution.suiteHash || dist.configHash !== first.distribution.configHash || dist.shard.total !== total || JSON.stringify(dist.allFiles) !== JSON.stringify(first.distribution.allFiles) || JSON.stringify(dist.setupFiles) !== JSON.stringify(first.distribution.setupFiles)) throw new Error('Shards belong to different suites or browser configurations.');
@@ -89,6 +100,12 @@ export function mergeResults(summaries: string[], output = 'flowstride-merged') 
     }
     for (const step of report.steps) steps.push({ ...step, shard: index });
     attempts.push(...(report.attempts || []).map((attempt: any) => ({ ...attempt, shard: index })));
+    if (Array.isArray(report.dependencies)) {
+      for (const event of report.dependencies) dependencies.push({ ...event, shard: index });
+    }
+    if (Array.isArray(report.fixtureCleanups)) {
+      for (const cleanup of report.fixtureCleanups) fixtureCleanups.push({ ...cleanup, shard: index });
+    }
     errors.push(...report.errors.map((error: string) => `Shard ${index}: ${error}`));
     for (const [file, duration] of Object.entries(report.timings || {})) if (typeof duration === 'number' && duration >= 0) timings[file] = Math.max(timings[file] || 0, duration);
   }
@@ -97,7 +114,7 @@ export function mergeResults(summaries: string[], output = 'flowstride-merged') 
   const statuses = inputs.map(input => input.report.status), status = statuses.includes('interrupted') ? 'interrupted' : statuses.includes('failed') || errors.length ? 'failed' : steps.length && steps.every(step => step.skipReason) ? 'skipped' : 'passed';
   const metrics = inputs.reduce((all, { report }) => { for (const key of ['total','passed','failed','skipped','incomplete'] as const) { const n = report.metrics?.[key]; if (!Number.isSafeInteger(n) || n < 0) throw new Error('Invalid shard metrics.'); all[key] += n; } return all; }, { total:0, passed:0, failed:0, skipped:0, incomplete:0 });
   // Preserve shard-level metrics (setup executes independently on each machine).
-  const merged = { protocol:1, engine:first.engine, browser:first.browser, browsers:inputs.flatMap(({report}) => (report.browsers || []).map((info: any) => ({ ...info, shard: report.distribution.shard.index }))), status, metrics, steps, attempts, errors, timings, files:[...seenFiles], duration:Math.max(...inputs.map(input => input.report.duration)), distribution:{ ...first.distribution, merged:true, setupRunsPerShard:true } };
+  const merged = { protocol:1, engine:first.engine, browser:first.browser, browsers:inputs.flatMap(({report}) => (report.browsers || []).map((info: any) => ({ ...info, shard: report.distribution.shard.index }))), status, metrics, steps, attempts, errors, ...(fixtureCleanups.length && { fixtureCleanups }), ...(dependencies.length && { dependencies }), timings, files:[...seenFiles], duration:Math.max(...inputs.map(input => input.report.duration)), distribution:{ ...first.distribution, merged:true, setupRunsPerShard:true } };
   fs.mkdirSync(out, { recursive: true, mode:0o700 });
   try {
     for (const { file, report } of inputs) {

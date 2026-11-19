@@ -158,11 +158,16 @@ const getLogDisplayData = (log: LogEvent) => {
 };
 
 export const LogsView = () => {
-  const { logs, selectedLogId, setSelectedLogId, activeReplay, updateReplay } =
+  const { logs, selectedLogId, setSelectedLogId, activeReplay, updateReplay, recordedVideos } =
     useFlowStore();
   const [activeFilter, setActiveFilter] = useState<"ALL" | LogType>("ALL");
   const [activeTab, setActiveTab] = useState("Overview");
-  const [activeVideoFile, setActiveVideoFile] = useState<string | null>(null);
+  const [selectedVideo, setActiveVideoFile] = useState<string | null>(null);
+  const [videoFailed, setVideoFailed] = useState(false);
+  const activeVideoFile = selectedVideo && recordedVideos.includes(selectedVideo) ? selectedVideo : null;
+  useEffect(() => {
+    if (selectedVideo && !activeVideoFile) setActiveVideoFile(null);
+  }, [selectedVideo, activeVideoFile]);
 
   const [isCopied, setIsCopied] = useState(false);
 
@@ -786,9 +791,11 @@ export const LogsView = () => {
                       gap: "8px",
                     }}
                   >
-                    <button
+                    {recordedVideos.includes(section.fileName) && <button
+                      aria-label={"Watch " + section.fileName}
                       onClick={(e) => {
                         e.stopPropagation();
+                        setVideoFailed(false);
                         setActiveVideoFile(section.fileName);
                         setSelectedLogId(null);
                       }}
@@ -816,7 +823,7 @@ export const LogsView = () => {
                       }
                     >
                       <Film size={10} /> Watch
-                    </button>
+                    </button>}
 
                     {hasError && (
                       <span
@@ -1018,19 +1025,26 @@ export const LogsView = () => {
                   "radial-gradient(circle at center, #161b22 0%, #000 100%)",
               }}
             >
-              <video
-                key={activeVideoFile}
-                src={`http://${window.location.host}/videos/${activeVideoFile.replace(".flow", "")}.webm`}
-                controls
-                autoPlay
-                style={{
-                  maxWidth: "100%",
-                  maxHeight: "100%",
-                  boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
-                  borderRadius: "8px",
-                  border: "1px solid #30363d",
-                }}
-              />
+              {videoFailed ? (
+                <p role="status" style={{ color: "#cbd5e1" }}>The recording could not be loaded. Rerun the test to record it again.</p>
+              ) : (
+                <video
+                  key={activeVideoFile}
+                  src={"/videos/" + encodeURIComponent(activeVideoFile)}
+                  controls
+                  autoPlay
+                  muted
+                  playsInline
+                  onError={() => setVideoFailed(true)}
+                  style={{
+                    maxWidth: "100%",
+                    maxHeight: "100%",
+                    boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+                    borderRadius: "8px",
+                    border: "1px solid #30363d",
+                  }}
+                />
+              )}
             </div>
           </div>
         ) : selectedLog ? (

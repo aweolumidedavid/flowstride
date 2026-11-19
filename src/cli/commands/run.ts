@@ -1,8 +1,10 @@
 import { runtimeFailure } from '../../reporting/runtime_failure';
-import { needsNativeBrowserProtocol, needsNativeValueProtocol, needsNativeControlProtocol, needsNativeInteractionProtocol, needsNativeBrowsingProtocol, needsNativeDataProtocol, needsNativeWorkflowProtocol, needsNativeApiProtocol, needsNativeApplicationEvidenceProtocol } from '../../native/compatibility';
+import { needsNativeHandoffProtocol, needsNativeFixtureProtocol, needsNativeHelperProtocol, needsNativeBrowserProtocol, needsNativeValueProtocol, needsNativeControlProtocol, needsNativeInteractionProtocol, needsNativeBrowsingProtocol, needsNativeDataProtocol, needsNativeWorkflowProtocol, needsNativeApiProtocol, needsNativeApplicationEvidenceProtocol } from '../../native/compatibility';
 import { projectPath } from '../../utils/projectPaths';
-import { loadNativeConfig, isCIEnvironment } from '../../ci/config';
+import { loadNativeConfig } from '../../ci/config';
 import { runNativeCI } from '../../ci/runtime';
+import { startPracticeRun } from '../../practice/server';
+import { practiceHandoffSelected } from '../../practice/project';
 import * as fs from "fs";
 import * as path from "path";
 import * as dotenv from "dotenv";
@@ -22,8 +24,10 @@ import { ApiProxy } from "../../sdk/api_proxy";
 export async function runAction(
   targetPath: string,
   options: Record<string, any>,
+  practice = false,
 ) {
   const root = process.cwd();
+  if (options.env && !/^[a-zA-Z0-9_-]+$/.test(options.env)) throw new Error('Invalid environment profile name.');
 
   const profileEnvPath = options.env
     ? projectPath(root, `.env.${options.env}`)
@@ -48,10 +52,14 @@ export async function runAction(
     }
   }
 
-  const config = loadNativeConfig(root, options);
+  const retries = practice && practiceHandoffSelected(root, targetPath) ? 1 : undefined;
+  const config = loadNativeConfig(root, options, { retries });
+  if (practice) config.baseUrl = undefined;
   const isCI = !!config.ci;
 
-  if (isCI) {
+  if (practice) {
+    console.log('[Flowstride]: Running the local practice suite.');
+  } else if (isCI) {
     console.log(
       "\n[CI/CD]: Environment detected. Engaging Smart Automation Behaviors...",
     );
@@ -161,6 +169,18 @@ export async function runAction(
           needsNativeApplicationEvidenceProtocol(resolvedPath, config)) {
         throw new Error('Installed Cloud engine does not support these console, channel or visual capabilities. This run will use OS fallback.');
       }
+      if ((proWorkerModule.FlowWorker.nativeHelperProtocol !== 1 || proOrchModule.FlowOrchestrator.nativeHelperProtocol !== 1) &&
+          needsNativeHelperProtocol(resolvedPath, config)) {
+        throw new Error('Installed Pro engine does not support JavaScript and TypeScript helpers. This run will use the open-source engine.');
+      }
+      if ((proWorkerModule.FlowWorker.nativeFixtureProtocol !== 1 || proOrchModule.FlowOrchestrator.nativeFixtureProtocol !== 1) &&
+          needsNativeFixtureProtocol(resolvedPath, config)) {
+        throw new Error('Installed Pro engine does not support runner-managed fixtures. This run will use the open-source engine.');
+      }
+      if ((proWorkerModule.FlowWorker.nativeHandoffProtocol !== 1 || proOrchModule.FlowOrchestrator.nativeHandoffProtocol !== 1) &&
+          needsNativeHandoffProtocol(resolvedPath, config)) {
+        throw new Error('Installed Pro engine does not support test dependencies. This run will use the open-source engine.');
+      }
       ActiveFlowWorker = proWorkerModule.FlowWorker;
       ActiveFlowOrchestrator = proOrchModule.FlowOrchestrator;
       engineMode = "Enterprise (Pro)";
@@ -185,7 +205,7 @@ export async function runAction(
   const orchestrator = new ActiveFlowOrchestrator(worker, workerCount, config);
 
   if (isCI) {
-    const result = await runNativeCI(worker, orchestrator, resolvedPath, config, engineMode);
+    const result = await runNativeCI(worker, orchestrator, resolvedPath, config, engineMode, practice);
     console.log(`[Flowstride]: ${result.status}; reports: ${config.artifactsDir}`);
     process.exit(['passed', 'skipped'].includes(result.status) ? 0 : result.status === 'interrupted' ? 130 : 1);
   }
@@ -195,35 +215,19 @@ export async function runAction(
     previousRunEvent?.(event);
     if (event.type === 'RUN_COMPLETE') process.exitCode = event.payload?.status === 'success' ? 0 : ['aborted','interrupted'].includes(event.payload?.status) ? 130 : 1;
   };
+  let stopPractice: (() => Promise<void>) | undefined;
   try {
+    // The local app shares the dashboard session so Replay and Rerun can reach it.
+    if (practice) stopPractice = await startPracticeRun(config);
     const isSuccess = await orchestrator.start(resolvedPath);
     process.exitCode = isSuccess ? 0 : 1;
     console.log(isSuccess ? "\n[Flowstride]: Execution suite completed successfully." : "\n[Flowstride]: Execution suite failed.");
 
-    if (isCI) {
-      const artifactsDir = path.resolve(root, "flowstride-artifacts");
-      if (!fs.existsSync(artifactsDir)) {
-        fs.mkdirSync(artifactsDir, { recursive: true });
-      }
-      console.log(
-        `[CI Artifacts]: Test environment artifacts auto-staged to ./flowstride-artifacts/`,
-      );
-      process.exit(0);
-    } else {
-      console.log(
-        "\n[Dashboard]: Server remains active for Replay and Debugging. Press Ctrl+C to exit.",
-      );
-      await new Promise(() => {});
-    }
+    console.log('\n[Dashboard]: Server remains active for Replay and Debugging. Press Ctrl+C to exit.');
+    await new Promise(() => {});
   } catch (error: any) {
-    console.error("\n[Fatal Error]:", runtimeFailure("run.setup",{path:resolvedPath},error,{file:resolvedPath}));
-
-    if (isCI) {
-      console.log(
-        `[CI Alert]: Terminating pipeline with exit code 1 to block deployment.`,
-      );
-    }
-
+    await stopPractice?.().catch(() => {});
+    console.error('\n[Fatal Error]:', runtimeFailure('run.setup', { path: resolvedPath }, error, { file: resolvedPath }));
     process.exit(1);
   }
 }
