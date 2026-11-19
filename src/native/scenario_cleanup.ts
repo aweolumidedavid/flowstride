@@ -1,6 +1,10 @@
 import { request } from 'undici';
 import { z } from 'zod';
 import type { StepNode } from '../parser/parser';
+import type { FixtureTeardown } from '../types';
+import { withDeadline } from '../ci/deadline';
+
+export const CLEANUP_BUDGET_MS = 4000;
 
 const registration = z.object({
   method: z.literal('DELETE'),
@@ -25,17 +29,32 @@ export function resolveCleanupTarget(template: string, resolve: (component: stri
   }).join('');
 }
 
-interface CleanupEntry {
-  step: StepNode;
-  url: URL;
-  headers: Record<string, string>;
+type CleanupEntry =
+  | { step: StepNode; url: URL; headers: Record<string, string> }
+  | { fixture: FixtureCleanup; release: FixtureTeardown; handoff?: string };
+
+export async function runFixtureTeardown(release: FixtureTeardown, timeout: number): Promise<void> {
+  const controller = new AbortController();
+  try {
+    await withDeadline(Promise.resolve().then(() => release(controller.signal)), timeout);
+  } finally {
+    controller.abort();
+  }
 }
 
-export interface CleanupOutcome {
-  step: StepNode;
-  status?: number;
-  error?: string;
+export interface FixtureCleanup {
+  name: string;
+  scope: 'attempt' | 'worker';
+  handoff?: string;
+  fileName: string;
+  sourceLine: number;
+  scenario: string;
+  attempt: number;
 }
+
+export type CleanupOutcome =
+  | { step: StepNode; status?: number; error?: string }
+  | { fixture: FixtureCleanup; error?: string };
 
 const unsafeHeader = /^(?:host|connection|upgrade|transfer-encoding|content-length|expect|te|trailer|keep-alive|proxy-.*)$/i;
 
@@ -68,11 +87,25 @@ export class ScenarioCleanup {
 
   register(step: StepNode, input: unknown, headers: Record<string, string>): void {
     if (this.result) throw new Error('This scenario has already started cleanup.');
-    if (this.entries.length >= 32) throw new Error('A scenario attempt can register at most 32 cleanup requests.');
+    if (this.entries.filter(entry => 'url' in entry).length >= 32) throw new Error('A scenario attempt can register at most 32 cleanup requests.');
     const data = cleanupRegistration(input);
     const url = cleanupURL(this.baseUrl, data.url);
     const captured = Object.fromEntries(Object.entries(headers).filter(([name]) => !unsafeHeader.test(name)));
     this.entries.push({ step, url, headers: captured });
+  }
+
+  defer(fixture: FixtureCleanup, release: FixtureTeardown, handoff?: string): void {
+    if (this.result) throw new Error('This scope has already started cleanup.');
+    this.entries.push({ fixture: handoff ? { ...fixture, handoff } : fixture, release, handoff });
+  }
+
+  transferTo(target: ScenarioCleanup, handoffs?: ReadonlySet<string>): void {
+    if (this.result || target.result) throw new Error('Cannot transfer resources after cleanup starts.');
+    this.entries = this.entries.filter(entry => {
+      if (handoffs && !('handoff' in entry && entry.handoff && handoffs.has(entry.handoff))) return true;
+      target.entries.push(entry);
+      return false;
+    });
   }
 
   get hasEntries(): boolean {
@@ -84,14 +117,29 @@ export class ScenarioCleanup {
   }
 
   private async execute(): Promise<CleanupOutcome[]> {
-    const deadline = Date.now() + 4000;
+    const deadline = Date.now() + CLEANUP_BUDGET_MS;
     const outcomes: CleanupOutcome[] = [];
-    for (const { step, url, headers } of [...this.entries].reverse()) {
+    const entries = [...this.entries].reverse();
+    for (const [index, entry] of entries.entries()) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        outcomes.push({ step, error: 'Cleanup deadline expired before the request could start.' });
+        if ('fixture' in entry) outcomes.push({ fixture: entry.fixture, error: 'Cleanup deadline expired before this callback could start.' });
+        else outcomes.push({ step: entry.step, error: 'Cleanup deadline expired before the request could start.' });
         continue;
       }
+      if ('release' in entry) {
+        try {
+          // Leave time for earlier resources even when a user callback stalls.
+          const timeout = Math.max(1, Math.min(2000, Math.floor(remaining / (entries.length - index))));
+          await runFixtureTeardown(entry.release, timeout);
+          outcomes.push({ fixture: entry.fixture });
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : typeof error === 'string' ? error : 'Callback rejected with a non-Error value.';
+          outcomes.push({ fixture: entry.fixture, error: reason || 'Callback failed without an error message.' });
+        }
+        continue;
+      }
+      const { step, url, headers } = entry;
       const signal = AbortSignal.timeout(Math.min(2000, remaining));
       try {
         const response = await request(url, {

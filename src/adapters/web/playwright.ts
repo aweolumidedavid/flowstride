@@ -23,6 +23,7 @@ export class WebAdapter {
   public onPageChanged?: () => Promise<void>;
 
   public profileNames(): string[] { return [...this.profiles.keys()]; }
+  public profileContext(name: string): BrowserContext | undefined { return this.profiles.get(name)?.context; }
   public getContext(): BrowserContext { if (!this.context) throw new Error('Browser not initialised'); return this.context; }
 
   public async createProfile(profileName: string, options: unknown = {}): Promise<void> {
@@ -78,8 +79,8 @@ export class WebAdapter {
     protectEvidenceTree(this.config, this.config.artifactsDir || 'flowstride-artifacts');
     return profile.tracePath;
   }
-  private async finishProfile(key: string, videoTargetPath?: string): Promise<void> {
-    const profile = this.profiles.get(key); if (!profile) return;
+  private async finishProfile(key: string, videoTargetPath?: string): Promise<boolean> {
+    const profile = this.profiles.get(key); if (!profile) return false;
     for (const page of profile.context.pages()) await this.clearSessionStorageRestore(page);
     if (profile.tracing) await this.endTrace(key);
     const video = profile.page.video();
@@ -87,8 +88,13 @@ export class WebAdapter {
     if (this.config.har) protectEvidenceTree(this.config, this.config.artifactsDir || 'flowstride-artifacts');
     if (video) {
       const target = videoTargetPath || (key !== 'default' ? evidencePath(this.config, `${key}-${Date.now()}.webm`) : undefined);
-      if (target) await video.saveAs(target);
+      if (target) {
+        await video.saveAs(target);
+        if (videoTargetPath) await video.delete().catch(() => {});
+        return !!videoTargetPath;
+      }
     }
+    return false;
   }
 
   public async checkpointProfiles(): Promise<any> {
@@ -104,7 +110,7 @@ export class WebAdapter {
   }
   public async restoreProfiles(snapshot: any): Promise<void> {
     await this.clearSessionStorageRestore();
-    for (const [key] of this.profiles) await this.finishProfile(key, evidencePath(this.config, `${key}-${Date.now()}-attempt.webm`));
+    for (const [key] of this.profiles) await this.finishProfile(key, this.config.protectedHandoff ? undefined : evidencePath(this.config, `${key}-${Date.now()}-attempt.webm`));
     this.profiles.clear(); this.namedPages.clear(); this.frameScopes = new WeakMap(); this.dialogHandler = snapshot.dialogHandler;
     const pendingScopes: {profile:string;page:Page;path:any[]}[] = [];
     for (const saved of snapshot.profiles) {
@@ -2241,13 +2247,17 @@ export class WebAdapter {
     );
   }
 
-  public async shutdown(videoTargetPath?: string): Promise<void> {
+  public async shutdown(videoTargetPath?: string): Promise<boolean> {
     const failures: unknown[] = [];
+    let savedVideo = false;
     try {
       await this.clearSessionStorageRestore();
       const active = this.profiles.get(this.activeProfile); if (active && this.page) active.page = this.page;
       for (const [key] of this.profiles) {
-        try { await this.finishProfile(key, key === 'default' ? videoTargetPath : undefined); }
+        try {
+          const saved = await this.finishProfile(key, key === 'default' ? videoTargetPath : undefined);
+          savedVideo ||= saved;
+        }
         catch (error) { failures.push(error); }
       }
     } finally {
@@ -2255,5 +2265,6 @@ export class WebAdapter {
       this.profiles.clear(); this.namedPages.clear(); this.frameScopes = new WeakMap(); this.context = null; this.page = null; this.browser = null;
     }
     if (failures.length) throw new AggregateError(failures, 'Browser evidence finalization failed.');
+    return savedVideo;
   }
 }

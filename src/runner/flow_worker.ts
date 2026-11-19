@@ -1,10 +1,17 @@
+import { createHash } from 'node:crypto';
+import { handoffSecrets, snapshotHandoff, type HandoffCommand, type HandoffValue } from '../native/handoff';
+import type { HandoffAssignment, HandoffWorkerSource } from './handoff_coordinator';
 import { isWorkflowToken, prepareWorkflowFeatures } from '../native/workflow_plan';
-import { cleanupRegistration, resolveCleanupTarget, ScenarioCleanup } from '../native/scenario_cleanup';
+import { cleanupRegistration, resolveCleanupTarget, ScenarioCleanup, type FixtureCleanup } from '../native/scenario_cleanup';
 import { caseRows, type CaseScenario, type CaseInfo } from '../native/data_plan';
 import { loadDataSchema, casesSchema, loadProjectData, dataSecrets } from '../native/project_data';
 import { interpolateData, hasExactDataReference } from '../native/data_references';
 import { isSensitiveField } from '../security/sensitiveFields';
 import { ExecutionControl, isPauseId } from './execution_control';
+import { callProjectHelper, invokeProjectHelper, resolveProjectHelper } from './project_helper';
+import { setupFixture, type FixtureRelease } from './project_fixture';
+import { practiceHandoffFrames } from '../practice/project';
+import { localVideoPath } from '../reporting/local_video';
 import { isCIEnvironment } from '../ci/config';
 import { poll } from '../native/validation';
 import { dataSnapshot, readBrowserProperty } from '../native/paths';
@@ -31,7 +38,7 @@ import { ApiAdapter } from "../adapters/api/undici";
 import { SessionManager } from "../sessions/manager";
 import { FlowstrideConfig } from "../types";
 import { Lexer } from "../parser/lexer";
-import { Parser, ScenarioNode, DeclarationNode } from "../parser/parser";
+import { Parser, ScenarioNode, DeclarationNode, type HelperCallPayload, type FixtureCallPayload, type StepNode } from "../parser/parser";
 import { DataGenerators } from "./data_generators";
 import { PluginManager } from "./plugin_manager";
 import { DOMStripper } from "./dom_stripper";
@@ -63,6 +70,9 @@ export class FlowWorker extends EventEmitter {
   public static readonly nativeBrowsingProtocol = 1;
   public static readonly nativeDataProtocol = 1;
   public static readonly nativeWorkflowProtocol = 1;
+  public static readonly nativeHelperProtocol = 1;
+  public static readonly nativeFixtureProtocol = 1;
+  public static readonly nativeHandoffProtocol = 1;
   public static readonly nativeApiProtocol = 1;
   public static readonly nativeApplicationEvidenceProtocol = 1;
   private control = new ExecutionControl(
@@ -88,6 +98,8 @@ export class FlowWorker extends EventEmitter {
 
   private currentStepContext: string = "Initializing...";
   private currentFileName: string = "System";
+  private currentFlowPath = "";
+  private practiceFrames?: ReturnType<typeof practiceHandoffFrames>;
   private activeAudioPath: string | undefined = undefined;
 
   private currentCdpSession: any = null;
@@ -156,6 +168,20 @@ export class FlowWorker extends EventEmitter {
 
   private activeCleanup?: ScenarioCleanup;
   private cleanupReport?: Promise<boolean>;
+  private fixtureCancellation = new AbortController();
+  private pendingFixtureSetup?: Promise<void>;
+  private handoffSource?: HandoffWorkerSource;
+  private handoffFile?: HandoffAssignment;
+  private handoffFileCleanup?: ScenarioCleanup;
+  private handoffRunCleanup?: ScenarioCleanup;
+  private handoffRunReport?: Promise<boolean>;
+  private handoffOutputs = new Map<string, HandoffValue>();
+  private attemptHandoffs = new Map<string, HandoffValue>();
+  private publishesInAttempt?: Set<string>;
+  private workerFixtureValues = new Map<string, unknown>();
+  private workerFixtureCleanup?: ScenarioCleanup;
+  private workerCleanupReport?: Promise<boolean>;
+  private fixtureBindings = new Map<string, { previous?: PropertyDescriptor; wasAlias: boolean }>();
 
   private reportSkippedScenario(scenario: ScenarioNode): void {
     const reason = scenario.skipReason!;
@@ -189,11 +215,34 @@ export class FlowWorker extends EventEmitter {
     return this.cleanupReport ??= this.reportCleanup(this.activeCleanup);
   }
 
+  private finishWorkerFixtures(): Promise<boolean> {
+    if (!this.workerFixtureCleanup) return Promise.resolve(false);
+    return this.workerCleanupReport ??= this.reportCleanup(this.workerFixtureCleanup).finally(() => this.workerFixtureValues.clear());
+  }
+
+  private finishHandoffCleanup(): Promise<boolean> {
+    if (!this.handoffRunCleanup?.hasEntries) return Promise.resolve(false);
+    return this.handoffRunReport ??= this.reportCleanup(this.handoffRunCleanup);
+  }
+
   private async reportCleanup(cleanup: ScenarioCleanup): Promise<boolean> {
     let failed = false;
     for (const outcome of await cleanup.drain()) {
-      const { step, status, error } = outcome;
+      const { error } = outcome;
       failed ||= !!error;
+      if ('fixture' in outcome) {
+        const fixture = outcome.fixture;
+        const message = error
+          ? `Fixture "${fixture.name}" cleanup failed: ${error}`
+          : `Fixture "${fixture.name}" cleanup completed.`;
+        const diagnostic = redactText(message, this.secretValues()).slice(0, 12000);
+        this.broadcast('FIXTURE_CLEANUP', { ...fixture, status: error ? 'failed' : 'passed', error: error ? diagnostic : undefined });
+        this.emitLog(error ? 'ERROR' : 'ACTION', error ? 'error' : 'info',
+          diagnostic, { commandLabel: 'fixture cleanup', sourceLine: fixture.sourceLine }, undefined, fixture.fileName);
+        if (!this.isSilent) console.log('    [Cleanup] ' + diagnostic.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ''));
+        continue;
+      }
+      const { step, status } = outcome;
       const file = step.sourceFile || this.currentFileName;
       const diagnostic = error ? `${file}:${step.line}: ${error}` : undefined;
       const message = error || `Cleanup DELETE completed (HTTP ${status}).`;
@@ -234,7 +283,7 @@ export class FlowWorker extends EventEmitter {
       if(type==='STEP_ADD'&&typeof payload.description==='string'&&!payload.description.endsWith(`· Case ${info.index}/${info.total}`))payload={...payload,description:payload.description+` · Case ${info.index}/${info.total}`};
     }
     if (["STEP_ADD","STEP_UPDATE","LOG_EVENT"].includes(type)) payload = { ...payload, ...(this.currentDataCase ? {dataCase:{index:this.currentDataCase.index+1,total:this.currentDataCase.total,file:this.currentDataCase.file},scenario:this.currentScenarioName} : {}), attempt: this.attempt, profile: this.web.activeProfile || "default" };
-    const safe = redactWorkerPayload(type, payload, this.secretValues(), this.config.ci === false);
+    const safe = redactWorkerPayload(type, payload, this.secretValues(), this.config.ci === false && !this.config.protectedHandoff);
     if (['EXECUTION_PAUSED','EXECUTION_RESUMED'].includes(type) && isPauseId(payload?.id)) {
       // A generated routing identifier is opaque, not application data or a credential.
       safe.id = payload.id;
@@ -293,9 +342,26 @@ export class FlowWorker extends EventEmitter {
     const context: { screenshot?: string; boundingBox?: any } = {};
 
     try {
-      if (!screenshotEvidence(this.config)) return {};
-      const buffer = await page.screenshot({ type: "jpeg", quality: 50 });
-      context.screenshot = buffer.toString("base64");
+      const preview = this.practiceFrames;
+      if (preview) {
+        const url = page.url();
+        if (!url.startsWith(preview.origin + '/')) return {};
+        const buffer = await page.screenshot({
+          type: 'jpeg', quality: 50, timeout: 3000,
+          // The local examples use synthetic names and emails. Show passwords as dots.
+          mask: [page.locator('input:not(#login-email, #user-name, #user-email, [type="password"]), textarea, [contenteditable]')],
+          maskColor: '#e4e0eb',
+          style: 'input[type="password"] { -webkit-text-security: disc !important; }',
+        });
+        if (page.url() !== url) return {};
+        context.screenshot = buffer.toString('base64');
+        this.broadcast('BROWSER_FRAME', { base64: context.screenshot, fileName: this.currentFileName });
+        this.broadcast('URL_CHANGE', { url, title: await page.title(), fileName: this.currentFileName });
+      } else {
+        if (!screenshotEvidence(this.config)) return {};
+        const buffer = await page.screenshot({ type: 'jpeg', quality: 50 });
+        context.screenshot = buffer.toString('base64');
+      }
     } catch (e) {}
 
     if (payload && payload.selector) {
@@ -613,14 +679,16 @@ export class FlowWorker extends EventEmitter {
 
   public abort(): void {
     this.isAborted = true;
+    this.handoffSource?.cancel('Execution was interrupted before this file could start.');
+    this.fixtureCancellation.abort(new Error('Fixture setup cancelled.'));
     this.control.cancel();
     this.api.cancelNativeRequests?.();
     this.native.events.cancelRoutes();
     this.native.applicationEvents.cancel();
   }
 
-  public async runBatch(filesToProcess: string[]): Promise<boolean> {
-    this.batchPassed = filesToProcess.length > 0;
+  public async runBatch(filesToProcess: string[], handoffSource?: HandoffWorkerSource): Promise<boolean> {
+    this.batchPassed = !!handoffSource || filesToProcess.length > 0;
     const isCliHeadless = process.argv.includes("--headless");
 
     if (isCliHeadless) {
@@ -633,13 +701,29 @@ export class FlowWorker extends EventEmitter {
     if(ownDataPlan)this.config.nativeDataManifest={};
     this.activeAudioPath = undefined;
     this.control.reset();
+    this.workerFixtureCleanup = undefined;
+    this.workerCleanupReport = undefined;
+    this.handoffSource = handoffSource;
+    this.handoffRunCleanup = handoffSource && new ScenarioCleanup(this.config.baseUrl);
+    this.handoffRunReport = undefined;
+    const previousSecrets = this.extractedSecretValues;
+    const previousGlobals = FlowWorker.globalVariables;
+    const previousGlobalSessions = FlowWorker.globalBrowserSessions;
+    const previousGlobalSecrets = FlowWorker.extractedGlobalSecretValues;
+    if (handoffSource) {
+      this.extractedSecretValues = new Set(previousSecrets);
+      FlowWorker.globalVariables = {};
+      FlowWorker.globalBrowserSessions = {};
+      FlowWorker.extractedGlobalSecretValues = new Set(previousGlobalSecrets);
+    }
+    this.fixtureCancellation = new AbortController();
     this.isAborted = false;
     this.api.resetCancellation?.();
     this.bailTriggered = false;
     this.isDebugHalted = false;
 
     const sigintHandler = async () => {
-      if (this.config.ci) { this.abort(); return; }
+      if (this.config.ci || handoffSource) { this.abort(); return; }
       if (!this.isSilent) {
         console.log(
           chalk.yellow(
@@ -650,7 +734,9 @@ export class FlowWorker extends EventEmitter {
       this.abort();
       this.broadcast("SERVER_SHUTDOWN", { message: "Terminal closed." });
       try {
+        await this.pendingFixtureSetup?.catch(() => {});
         await this.finishScenarioCleanup();
+        await this.finishWorkerFixtures();
         await this.web.shutdown();
       } catch (e) {}
       if (!this.config.ci) process.exit(this.isAborted ? 130 : process.exitCode || 0);
@@ -659,11 +745,11 @@ export class FlowWorker extends EventEmitter {
     process.once("SIGINT", sigintHandler);
 
     try {
-      for (const filePath of filesToProcess) {
+      for (const filePath of handoffSource ? [] : filesToProcess) {
         const content = fs.readFileSync(filePath, "utf8");
         let rawPath: string | undefined;
         const mightUseWorkflow = this.config.scenarioTags?.length ||
-          /flow\.(?:call|skipIf|cleanup\.register)|^\s*Tags:/im.test(content);
+          /flow\.(?:call|fixture\.|skipIf|cleanup\.register)|^\s*Tags:/im.test(content);
         const tokens = mightUseWorkflow ? new Lexer(content).tokenise() : undefined;
         if (tokens && (this.config.scenarioTags?.length || tokens.some(isWorkflowToken))) {
           const features = prepareWorkflowFeatures(new Parser(tokens).parse(), this.config);
@@ -686,13 +772,25 @@ export class FlowWorker extends EventEmitter {
         }
       }
 
-      for (const filePath of filesToProcess) {
-        if (this.isAborted || this.isDebugHalted || this.bailTriggered) break;
-
+      const files = filesToProcess[Symbol.iterator]();
+      while (!this.isAborted && !this.isDebugHalted && !this.bailTriggered) {
+        const assignment = handoffSource && await handoffSource.next();
+        const filePath = handoffSource ? assignment?.job.file : files.next().value;
+        if (!filePath) break;
+        if (this.isAborted) {
+          handoffSource?.done({ passed: false });
+          break;
+        }
+        this.handoffFile = assignment;
+        this.handoffOutputs.clear();
+        this.handoffFileCleanup = assignment && new ScenarioCleanup(this.config.baseUrl);
+        let filePassed = true;
         const fileStartTime = Date.now();
         try {
           const fileName = flowIdentity(filePath, this.config.flowRoot);
           this.currentFileName = fileName;
+          this.currentFlowPath = filePath;
+          this.practiceFrames = undefined;
           this.config.testFile = fileName;
 
           this.localVariables = {}; this.dataAliases.clear(); this.currentDataCase=undefined; this.caseGroup=undefined;
@@ -700,7 +798,22 @@ export class FlowWorker extends EventEmitter {
           this.api.resetState();
           this.dataGen = new DataGenerators();
           const content = fs.readFileSync(filePath,'utf8');
-          const features=prepareWorkflowFeatures(new Parser(new Lexer(content).tokenise()).parse(), this.config);
+          if (assignment && createHash('sha256').update(content).digest('hex') !== assignment.job.sha256) {
+            throw new Error('Flow changed after handoff planning. Start a new run.');
+          }
+          if (assignment) this.practiceFrames = practiceHandoffFrames(this.config, filePath, content);
+          const features = assignment?.job.features ??
+            prepareWorkflowFeatures(new Parser(new Lexer(content).tokenise()).parse(), this.config);
+          if (assignment) {
+            for (const input of Object.values(assignment.inputs)) {
+              for (const secret of handoffSecrets({ value: input.value, credentials: input.protectedCredentials?.values })) {
+                this.extractedSecretValues.add(secret);
+              }
+            }
+            const audio = features.flatMap(feature => feature.scenarios).filter(scenario => !scenario.skipReason)
+              .flatMap(scenario => scenario.steps).find(step => step.action === 'injectAudio');
+            this.activeAudioPath = audio ? projectPath(this.config.projectRoot || process.cwd(), audio.payload.file) : undefined;
+          }
 
           const scenarios = features.flatMap(feature => feature.scenarios);
           if (scenarios.length && scenarios.every(scenario => scenario.skipReason)) {
@@ -794,7 +907,10 @@ export class FlowWorker extends EventEmitter {
                 fileName: this.currentFileName,
               });
 
-              if (!await this.runPreparedScenario(s, f.declarations)) this.batchPassed = false;
+              if (!await this.runPreparedScenario(s, f.declarations)) {
+                filePassed = false;
+                this.batchPassed = false;
+              }
 
               if (this.isDebugHalted || this.bailTriggered) break;
 
@@ -818,35 +934,14 @@ export class FlowWorker extends EventEmitter {
             );
           if (!this.config.ci) await new Promise((resolve) => setTimeout(resolve, 2000));
 
-          try {
-            const baseName = videoFileName(this.currentFileName).replace(/\.webm$/, '');
-            const mockCloudDir = path.join(
-              process.cwd(),
-              ".flowstride",
-              "mock-cloud",
-            );
-            if (!fs.existsSync(mockCloudDir))
-              evidenceDirectory(this.config, mockCloudDir);
-
-            const targetVideoPath = prepareEvidenceFile(this.config, path.join(mockCloudDir, `${baseName}.webm`));
-
-            for (const message of (this.web.pageErrors || []).filter(Boolean)) this.broadcast('BROWSER_ERROR', { message, fileName: this.currentFileName });
-            await this.native.dispose();
-            await this.web.shutdown(targetVideoPath);
-            protectEvidenceTree(this.config, path.dirname(targetVideoPath));
-            if (!this.isSilent)
-              console.log(
-                chalk.gray(
-                  `      [Cloud Sync]: Video safely encoded and preserved for ${this.currentFileName}`,
-                ),
-              );
-          } catch (err) {}
+          await this.finishFileBrowser();
 
           this.broadcast("FILE_COMPLETE", {
             fileName: this.currentFileName,
             duration: Date.now() - fileStartTime,
           });
         } catch (e: any) {
+          filePassed = false;
           this.batchPassed = false;
           if (this.isAborted) break;
 
@@ -857,61 +952,71 @@ export class FlowWorker extends EventEmitter {
               ),
             );
 
-          try {
-            const baseName = videoFileName(this.currentFileName).replace(/\.webm$/, '');
-            const mockCloudDir = path.join(
-              process.cwd(),
-              ".flowstride",
-              "mock-cloud",
-            );
-            if (!fs.existsSync(mockCloudDir))
-              evidenceDirectory(this.config, mockCloudDir);
-
-            const targetVideoPath = prepareEvidenceFile(this.config, path.join(mockCloudDir, `${baseName}.webm`));
-
-            for (const message of (this.web.pageErrors || []).filter(Boolean)) this.broadcast('BROWSER_ERROR', { message, fileName: this.currentFileName });
-            await this.native.dispose();
-            await this.web.shutdown(targetVideoPath);
-            protectEvidenceTree(this.config, path.dirname(targetVideoPath));
-            if (!this.isSilent)
-              console.log(
-                chalk.gray(
-                  `      [Cloud Sync]: Video safely encoded and preserved for ${this.currentFileName}`,
-                ),
-              );
-          } catch (err) {}
+          await this.finishFileBrowser();
 
           this.broadcast("FILE_FAILED", {
             fileName: this.currentFileName,
             duration: Date.now() - fileStartTime,
             error: runtimeFailure("file.setup",{file:this.currentFileName},e,{file:this.currentFileName}),
           });
-        }
-      }
-
-      if (!this.config.ci && !this.isSilent && !this.isAborted) {
-        if (this.isDebugHalted) {
-          console.log(
-            chalk.cyan("\n[Execution]: Test suite halted by debug flag."),
-          );
-        } else {
-          console.log(
-            this.batchPassed ? chalk.green("\n[Execution]: All suites completed successfully.") : chalk.red("\n[Execution]: Test suite failed. Review the diagnostics above."),
-          );
+        } finally {
+          if (assignment) {
+            const passed = filePassed && !this.isAborted && !this.isDebugHalted && !this.bailTriggered;
+            if (this.handoffFileCleanup?.hasEntries) {
+              if (passed) this.handoffFileCleanup.transferTo(this.handoffRunCleanup!);
+              else if (await this.reportCleanup(this.handoffFileCleanup)) this.batchPassed = false;
+            }
+            handoffSource!.done({ passed, ...(passed && { outputs: Object.fromEntries(this.handoffOutputs) }) });
+            if (this.isDebugHalted || this.bailTriggered) handoffSource!.cancel('Execution stopped before this file could start.');
+            this.handoffFile = undefined;
+            this.handoffFileCleanup = undefined;
+            this.handoffOutputs.clear();
+          }
         }
       }
     } finally {
+      if (handoffSource) {
+        if (await this.finishHandoffCleanup()) this.batchPassed = false;
+        this.handoffSource = undefined;
+      }
+      if (await this.finishWorkerFixtures()) this.batchPassed = false;
       if (this.config.ci && this.isAborted) {
         try {
           const directory = path.join(this.config.projectRoot || process.cwd(), '.flowstride', 'artifacts');
           evidenceDirectory(this.config, directory);
           await this.native.dispose();
-          await this.web.shutdown(prepareEvidenceFile(this.config, path.join(directory, videoFileName(this.currentFileName))));
+          await this.web.shutdown(this.config.protectedHandoff || this.config.recordVideo === false ? undefined : prepareEvidenceFile(this.config, path.join(directory, videoFileName(this.currentFileName))));
           protectEvidenceTree(this.config, directory);
         } catch (error: any) { this.broadcast('WORKER_ERROR', { message: error.message }); }
       }
       process.removeListener("SIGINT", sigintHandler);
       if(ownDataPlan)delete this.config.nativeDataManifest;
+      if (handoffSource) {
+        this.localVariables = {};
+        this.localBrowserSessions = {};
+        this.dataAliases.clear();
+        this.commandSecretValues = [];
+        this.extractedSecretValues = previousSecrets;
+        FlowWorker.globalVariables = previousGlobals;
+        FlowWorker.globalBrowserSessions = previousGlobalSessions;
+        FlowWorker.extractedGlobalSecretValues = previousGlobalSecrets;
+        this.handoffRunCleanup = undefined;
+        this.handoffRunReport = undefined;
+        this.caseGroup = undefined;
+        this.api.resetState();
+        this.store.clear?.();
+      }
+    }
+    if (!this.config.ci && !this.isSilent && !this.isAborted) {
+      if (this.isDebugHalted) {
+        console.log(
+          chalk.cyan("\n[Execution]: Test suite halted by debug flag."),
+        );
+      } else {
+        console.log(
+          this.batchPassed ? chalk.green("\n[Execution]: All suites completed successfully.") : chalk.red("\n[Execution]: Test suite failed. Review the diagnostics above."),
+        );
+      }
     }
     return this.batchPassed && !this.isAborted && !this.isDebugHalted;
   }
@@ -940,26 +1045,51 @@ export class FlowWorker extends EventEmitter {
       const started = Date.now();
       this.broadcast('SCENARIO_ATTEMPT', { fileName: this.currentFileName, scenario: scenario.name, attempt: this.attempt });
       const errorIndex = this.web.pageErrors?.length || 0;
-      if (scenario.steps.some(step => step.action === 'native' && step.payload.pluginMethod.toLowerCase() === 'cleanup.register')) {
+      if (scenario.steps.some(step => step.action === 'fixture' ||
+          step.action === 'native' && step.payload.pluginMethod.toLowerCase() === 'cleanup.register')) {
         this.activeCleanup = new ScenarioCleanup(this.config.baseUrl);
         this.cleanupReport = undefined;
       }
+      this.attemptHandoffs.clear();
+      this.publishesInAttempt = this.handoffSource ? new Set(scenario.steps
+        .filter(step => step.action === 'handoff' && step.payload.kind === 'publish')
+        .map(step => step.payload.name)) : undefined;
       let completed = false;
       let cleanupFailed = false;
+      let retained: ScenarioCleanup | undefined;
       try {
         completed = await this.runScenario(structuredClone(scenario), declarations);
       } finally {
-        await this.native.applicationEvents.dispose();
-        cleanupFailed = await this.finishScenarioCleanup();
-        this.activeCleanup = undefined;
-        this.cleanupReport = undefined;
+        try {
+          await this.native.applicationEvents.dispose();
+        } finally {
+          try {
+            if (completed && !this.isAborted && this.attemptHandoffs.size && this.activeCleanup) {
+              retained = new ScenarioCleanup(this.config.baseUrl);
+              this.activeCleanup.transferTo(retained, new Set(this.attemptHandoffs.keys()));
+            }
+            cleanupFailed = await this.finishScenarioCleanup();
+          } finally {
+            this.restoreFixtureBindings();
+            this.activeCleanup = undefined;
+            this.cleanupReport = undefined;
+          }
+        }
       }
+      const browserErrors = this.web.pageErrors?.slice(errorIndex).filter(Boolean) || [];
+      const passed = completed && !cleanupFailed && (this.config.browserErrors === 'record' || !browserErrors.length);
+      if (passed && !this.isAborted && !this.isDebugHalted && !(this.config.failOnFlaky && this.attempt > 1)) {
+        if (retained?.hasEntries) retained.transferTo(this.handoffFileCleanup!);
+        for (const [name, output] of this.attemptHandoffs) this.handoffOutputs.set(name, output);
+      } else if (retained?.hasEntries) {
+        cleanupFailed = await this.reportCleanup(retained) || cleanupFailed;
+      }
+      this.attemptHandoffs.clear();
+      this.publishesInAttempt = undefined;
       if (cleanupFailed && this.config.bail && !this.bailTriggered) {
         this.bailTriggered = true;
         this.broadcast('BAIL', { fileName: this.currentFileName });
       }
-      const browserErrors = this.web.pageErrors?.slice(errorIndex).filter(Boolean) || [];
-      const passed = completed && !cleanupFailed && (this.config.browserErrors === 'record' || !browserErrors.length);
       if (this.config.browserErrors !== 'record') for (const message of browserErrors) {
         const error = runtimeFailure('browser.pageError',{},new Error(message),{file:this.currentFileName,profile:this.web.activeProfile || 'default'});
         this.emitLog('ERROR','error',error,{rawError:error,command:'browser.pageError'},undefined,this.currentFileName);
@@ -1011,7 +1141,24 @@ export class FlowWorker extends EventEmitter {
         const data = cleanupRegistration(step.payload.data);
         step.payload.data = { ...data, url: resolveCleanupTarget(data.url, component => this.resolveTemplateData(component)) };
       } else {
-        step.payload = this.resolveStepPayload(step.payload);
+        if (step.action === 'handoff') {
+          const command: HandoffCommand = step.payload;
+          if (command.kind === 'publish') {
+            command.value = this.resolveTypedAssertionValue(command.value);
+            if (command.credentials) {
+              command.credentials = Object.fromEntries(Object.entries(command.credentials)
+                .map(([key, reference]) => [key, this.resolveTypedAssertionValue(reference)]));
+              for (const value of Object.values(command.credentials)) {
+                if (typeof value === 'string') this.extractedSecretValues.add(value);
+              }
+            }
+          }
+        } else if (step.action === 'helper' || step.action === 'fixture') {
+          const args = (step.payload as HelperCallPayload).args.map(arg => this.resolveTypedAssertionValue(arg, false));
+          step.payload.args = step.action === 'fixture' ? dataSnapshot(args) : args;
+        } else {
+          step.payload = this.resolveStepPayload(step.payload);
+        }
       }
 
       } catch (error) { resolutionError = error; }
@@ -1061,7 +1208,7 @@ export class FlowWorker extends EventEmitter {
           commandLabel: stepLabel,
           sourceFile: step.sourceFile,
           sourceLine: step.line,
-          payload: isCleanup ? undefined : step.payload,
+          payload: isCleanup || step.action === 'helper' || step.action === 'fixture' || step.action === 'handoff' ? undefined : step.payload,
         },
         undefined,
         this.currentFileName,
@@ -1087,6 +1234,16 @@ export class FlowWorker extends EventEmitter {
         if (resolutionError) throw resolutionError;
         if (isCleanup) {
           this.activeCleanup!.register(step, step.payload.data, this.api.snapshotHeaders());
+        } else if (step.action === 'handoff') {
+          this.executeHandoff(step.payload);
+        } else if (step.action === 'fixture') {
+          const pending = this.executeFixture(step.payload, globalDeclarations, step);
+          this.pendingFixtureSetup = pending;
+          try {
+            await pending;
+          } finally {
+            this.pendingFixtureSetup = undefined;
+          }
         } else if (method !== 'skipif') {
           await this.executeStep(
             step.action,
@@ -1132,7 +1289,7 @@ export class FlowWorker extends EventEmitter {
         let strippedDom = "";
         try {
           const page = this.web.getPage();
-          if (page) {
+          if (page && !this.config.protectedHandoff) {
             strippedDom = await DOMStripper.getStrippedHTML(page);
           }
         } catch (domErr) {
@@ -1316,6 +1473,141 @@ export class FlowWorker extends EventEmitter {
     }
   }
 
+  private executeHandoff(command: HandoffCommand): void {
+    if (!this.handoffFile) throw new Error('Handoff commands require a coordinated run.');
+    if (command.kind === 'publish') {
+      const output = snapshotHandoff(command.value, command.credentials);
+      for (const secret of handoffSecrets(output)) this.extractedSecretValues.add(secret);
+      this.attemptHandoffs.set(command.name, output);
+      return;
+    }
+    if (!Object.hasOwn(this.handoffFile.inputs, command.name)) throw new Error('The required handoff is unavailable.');
+    const input = this.handoffFile.inputs[command.name]!;
+    this.bindAttemptData(command.as, structuredClone(input.value));
+    if (command.credentialsAs) {
+      if (!input.protectedCredentials?.values) throw new Error('The required protected credentials are unavailable.');
+      this.bindAttemptData(command.credentialsAs, structuredClone(input.protectedCredentials.values));
+    }
+  }
+
+  private bindAttemptData(name: string, value: unknown): void {
+    if (!this.fixtureBindings.has(name)) {
+      this.fixtureBindings.set(name, { previous: Object.getOwnPropertyDescriptor(this.localVariables, name), wasAlias: this.dataAliases.has(name) });
+    }
+    for (const secret of dataSecrets(value, isSensitiveField(name))) this.extractedSecretValues.add(secret);
+    Object.defineProperty(this.localVariables, name, { value, enumerable: true, writable: true, configurable: true });
+    this.dataAliases.add(name);
+  }
+
+  private resolveHelper(binding: DeclarationNode) {
+    const helper = resolveProjectHelper(this.config, this.currentFlowPath, binding);
+    // Use the checked bundled module for the entire captured run. Edits take effect on the next run.
+    if (this.practiceFrames?.specifier === helper.specifier && this.practiceFrames.helper) {
+      helper.file = this.practiceFrames.helper;
+    }
+    return helper;
+  }
+
+  private async executeFixture(call: FixtureCallPayload, declarations: DeclarationNode[], step: StepNode) {
+    const binding = declarations.find(item => item.kind === 'helper' && item.alias === call.name);
+    if (!binding) throw new Error(`Fixture "${call.name}" must be imported under Feature.`);
+    const helper = this.resolveHelper(binding);
+    const workerKey = call.scope === 'worker' ? JSON.stringify([helper.file, helper.name, call.args]) : undefined;
+    const origin: FixtureCleanup = {
+      name: call.name,
+      scope: call.scope,
+      fileName: this.currentFileName,
+      sourceLine: step.line,
+      scenario: this.currentScenarioName,
+      attempt: this.attempt,
+    };
+    this.fixtureCancellation.signal.throwIfAborted();
+    const value = workerKey !== undefined && this.workerFixtureValues.has(workerKey)
+      ? this.workerFixtureValues.get(workerKey)
+      : await this.startFixture(helper, call, origin, workerKey);
+    if (call.capture) {
+      const { name } = call.capture;
+      if (value === undefined) throw new Error(`Fixture "${call.name}" must return plain JSON data to use as "${name}".`);
+      this.bindAttemptData(name, workerKey === undefined ? value : structuredClone(value));
+    }
+  }
+
+  private async startFixture(
+    helper: ReturnType<typeof resolveProjectHelper>,
+    call: FixtureCallPayload,
+    origin: FixtureCleanup,
+    workerKey: string | undefined,
+  ): Promise<unknown> {
+    const signal = this.fixtureCancellation.signal;
+    const releases: FixtureRelease[] = [];
+    const profiles = call.scope === 'attempt' ? new Map<string, unknown>() : undefined;
+    let cleanup = this.activeCleanup!;
+    try {
+      const result = await setupFixture(this.config, signal, releases, profiles,
+        fixture => invokeProjectHelper(helper, () => {
+          fixture.signal.throwIfAborted();
+          return [fixture, ...call.args];
+        }), call.scope === 'attempt' ? this.publishesInAttempt : undefined,
+        call.scope === 'attempt' ? origin.attempt : undefined);
+      if (profiles?.size) await this.createFixtureProfiles(profiles, signal, releases);
+      signal.throwIfAborted();
+
+      let value: unknown;
+      if (call.capture || workerKey !== undefined && result !== undefined) {
+        try {
+          value = dataSnapshot(result);
+        } catch (error) {
+          throw new Error(`Fixture "${call.name}" must return plain JSON data for use in the flow or across scenarios.`, { cause: error });
+        }
+        for (const secret of dataSecrets(value)) this.extractedSecretValues.add(secret);
+      }
+      if (workerKey !== undefined) {
+        this.workerFixtureValues.set(workerKey, value);
+        cleanup = this.workerFixtureCleanup ??= new ScenarioCleanup(this.config.baseUrl);
+      }
+      return value;
+    } finally {
+      const secrets = this.commandSecretValues.slice();
+      for (const { release, handoff } of releases) {
+        cleanup.defer(origin, async signal => {
+          try {
+            await release(signal);
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : typeof error === 'string' ? error : 'Callback rejected with a non-Error value.';
+            throw new Error(redactText(detail, secrets));
+          }
+        }, handoff);
+      }
+    }
+  }
+
+  private async createFixtureProfiles(profiles: Map<string, unknown>, signal: AbortSignal, releases: FixtureRelease[]) {
+    const previous = this.web.activeProfile;
+    try {
+      for (const [name, options] of profiles) {
+        signal.throwIfAborted();
+        await this.native.execute('browser.create', { name, options });
+        // A test may explicitly close the profile and reuse the name.
+        const context = this.web.profileContext(name);
+        releases.push({ release: async () => {
+          if (context && this.web.profileContext(name) === context) await this.native.execute('browser.close', { name });
+        } });
+      }
+    } finally {
+      if (this.web.activeProfile !== previous) await this.native.execute('browser.use', { name: previous });
+    }
+  }
+
+  private restoreFixtureBindings(): void {
+    for (const [name, { previous, wasAlias }] of this.fixtureBindings) {
+      if (previous) Object.defineProperty(this.localVariables, name, previous);
+      else delete this.localVariables[name];
+      if (wasAlias) this.dataAliases.add(name);
+      else this.dataAliases.delete(name);
+    }
+    this.fixtureBindings.clear();
+  }
+
   private async executeStep(
     action: string,
     payload: any,
@@ -1485,6 +1777,31 @@ export class FlowWorker extends EventEmitter {
           "FlowMail Error: Automated OTP extraction requires Flowstride Enterprise. Visit flowstride.io to start your 60-day free trial.",
         );
 
+      case 'helper': {
+        const call: HelperCallPayload = payload;
+        const binding = globalDeclarations.find(item => item.kind === 'helper' && item.alias === call.name);
+        if (!binding) throw new Error(`Helper "${call.name}" must be imported under Feature.`);
+        const result = await withDeadline(
+          callProjectHelper(this.config, this.currentFlowPath, binding, call, () => this.web.getPage(), this.resolveHelper(binding)),
+          this.config.timeout,
+        );
+        if (call.capture && !this.isAborted) {
+          const { name, isGlobal } = call.capture;
+          let value: unknown;
+          try {
+            value = dataSnapshot(result);
+          } catch (error) {
+            throw new Error(`Cannot save the return value of "${call.name}" as "${name}". Return plain JSON data.`, { cause: error });
+          }
+          const secrets = isGlobal ? FlowWorker.extractedGlobalSecretValues : this.extractedSecretValues;
+          for (const secret of dataSecrets(value, isSensitiveField(name))) secrets.add(secret);
+          const variables = isGlobal ? FlowWorker.globalVariables : this.localVariables;
+          Object.defineProperty(variables, name, { value, enumerable: true, writable: true, configurable: true });
+          if (!isGlobal) this.dataAliases.add(name);
+        }
+        break;
+      }
+
       case "plugin":
         if (!this.pluginManager) {
           throw new Error(
@@ -1496,12 +1813,12 @@ export class FlowWorker extends EventEmitter {
         const method = payload.pluginMethod;
 
         let resolvedPath = localDeclarations.find(
-          (d) => d.alias === alias,
+          (d) => d.kind !== "helper" && d.alias === alias,
         )?.path;
 
         if (!resolvedPath) {
           resolvedPath = globalDeclarations.find(
-            (d) => d.alias === alias,
+            (d) => d.kind !== "helper" && d.alias === alias,
           )?.path;
         }
 
@@ -1604,6 +1921,7 @@ export class FlowWorker extends EventEmitter {
           }
 
           if (payload.persist) {
+            if (this.config.protectedHandoff) throw new Error('Session persistence is disabled in a handoff run.');
             try {
               writePrivateState(process.cwd(), "sessions/" + stateSessionFile(payload.name), JSON.stringify(hybridState, null, 2));
             } catch (err: any) {
@@ -2086,45 +2404,78 @@ export class FlowWorker extends EventEmitter {
     });
   }
 
-  private async startStreaming() {
-    if (!screenshotEvidence(this.config)) return;
-    clearInterval(this.fallbackStream);
-    if (this.config.ci) return;
-    if (this.config.browser && this.config.browser !== 'chromium') {
-      const page = this.web.getPage(); let busy = false;
-      this.fallbackStream = setInterval(async () => {
-        if (busy || page.isClosed()) return; busy = true;
-        try { this.broadcast('BROWSER_FRAME', { base64: (await page.screenshot({ type:'jpeg', quality:60 })).toString('base64'), fileName:this.currentFileName }); } catch {} finally { busy = false; }
-      }, 250);
-      this.fallbackStream.unref(); return;
-    }
-    const page = this.web.getPage();
-    if (this.currentCdpSession) {
-      await this.currentCdpSession.detach().catch(() => {});
+  private async finishFileBrowser() {
+    let target: string | undefined;
+    if (!this.config.protectedHandoff && this.config.recordVideo !== false) {
+      const root = this.config.projectRoot || process.cwd();
+      try {
+        target = prepareEvidenceFile(this.config, localVideoPath(root, this.currentFileName));
+      } catch {
+        // A recording path problem must still allow the browser to shut down.
+      }
     }
 
-    this.currentCdpSession = await page.context().newCDPSession(page);
-    await this.currentCdpSession.send("Page.startScreencast", {
-      format: "jpeg",
-      quality: 60,
+    for (const message of (this.web.pageErrors || []).filter(Boolean)) {
+      this.broadcast('BROWSER_ERROR', { message, fileName: this.currentFileName });
+    }
+    try {
+      await this.native.dispose();
+      const saved = await this.web.shutdown(target);
+      if (!saved || !target) return;
+      protectEvidenceTree(this.config, path.dirname(target));
+      if (this.config.ci === false && fs.statSync(target).size > 0) {
+        this.broadcast('LOCAL_VIDEO_READY', { fileName: this.currentFileName });
+      }
+      if (!this.isSilent) console.log(chalk.gray('      [Video]: Recorded ' + this.currentFileName));
+    } catch {
+      // No replay is advertised when finalizing the recording fails.
+    }
+  }
+
+  private async startStreaming() {
+    clearInterval(this.fallbackStream);
+    if (this.currentCdpSession) {
+      const prior = this.currentCdpSession;
+      this.currentCdpSession = null;
+      await prior.detach().catch(() => {});
+    }
+    if (this.config.ci || !screenshotEvidence(this.config)) return;
+    const page = this.web.getPage();
+    const fileName = this.currentFileName;
+    if (this.config.browser && this.config.browser !== 'chromium') {
+      let busy = false;
+      this.fallbackStream = setInterval(async () => {
+        if (busy || page.isClosed() || !screenshotEvidence(this.config)) return;
+        busy = true;
+        try {
+          const base64 = (await page.screenshot({ type: 'jpeg', quality: 60 })).toString('base64');
+          if (!page.isClosed() && screenshotEvidence(this.config)) this.broadcast('BROWSER_FRAME', { base64, fileName });
+        } catch {
+        } finally {
+          busy = false;
+        }
+      }, 250);
+      this.fallbackStream.unref();
+      return;
+    }
+
+    const session = await page.context().newCDPSession(page);
+    this.currentCdpSession = session;
+    await session.send('Page.startScreencast', { format: 'jpeg', quality: 60 });
+    session.on('Page.screencastFrame', ({ data, sessionId }: any) => {
+      if (this.currentCdpSession === session && screenshotEvidence(this.config)) {
+        this.broadcast('BROWSER_FRAME', { base64: data, fileName });
+      }
+      session.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
     });
-    this.currentCdpSession.on(
-      "Page.screencastFrame",
-      ({ data, sessionId }: any) => {
-        this.broadcast("BROWSER_FRAME", {
-          base64: data,
-          fileName: this.currentFileName,
-        });
-        this.currentCdpSession
-          .send("Page.screencastFrameAck", { sessionId })
-          .catch(() => {});
-      },
-    );
   }
 
   public async shutdown(): Promise<void> {
     clearInterval(this.fallbackStream);
+    await this.pendingFixtureSetup?.catch(() => {});
     await this.finishScenarioCleanup();
+    await this.finishHandoffCleanup();
+    await this.finishWorkerFixtures();
     await this.native.dispose();
     try {
       await this.web.shutdown();

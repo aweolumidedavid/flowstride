@@ -137,6 +137,7 @@ export const ReportsView = () => {
             >
               Multi-Flow Execution Analysis
             </p>
+            <a href="/run-reports" target="_blank" rel="noreferrer" style={{ color: '#4338ca', fontSize: '14px' }}>Saved runs</a>
           </div>
           <div style={{ display: "flex", gap: "16px" }}>
             <StatCard

@@ -16,7 +16,7 @@ const skipRule = z.object({
 }).strict();
 
 export function isWorkflowToken(token: Token): boolean {
-  return token.type === TokenType.TAGS ||
+  return token.type === TokenType.TAGS || !!token.fixtureScope ||
     token.type === TokenType.ALIAS_COMMAND && /^flow\.(call|skipIf|cleanup\.register)$/i.test(token.value);
 }
 
@@ -34,7 +34,7 @@ export function selectWorkflowFeatures(features: FeatureNode[], config: Flowstri
   })).filter(feature => feature.scenarios.length);
 }
 
-function scenarioSkip(scenario: ScenarioNode, config: FlowstrideConfig): string | undefined {
+export function scenarioSkip(scenario: ScenarioNode, config: FlowstrideConfig): string | undefined {
   const index = scenario.steps.findIndex(step => isNative(step, 'skipIf'));
   if (index === -1) return;
   const step = scenario.steps[index];

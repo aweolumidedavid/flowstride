@@ -46,6 +46,10 @@ export const connectToRunner = () => {
           break;
         }
 
+        case 'FLOW_DEPENDENCY':
+          store.setDependencyState(data.payload);
+          break;
+
         case 'SCENARIO_RESULT':
           store.scenarioResult(data.payload);
           break;
@@ -72,6 +76,10 @@ export const connectToRunner = () => {
 
         case 'BROWSER_INFO':
           store.setBrowserInfo(data.payload.fileName, data.payload);
+          break;
+
+        case 'LOCAL_VIDEO_READY':
+          store.addRecordedVideo(data.payload.fileName);
           break;
 
         case "BROWSER_FRAME":

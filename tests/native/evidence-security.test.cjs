@@ -51,4 +51,44 @@ test('Cloud video privacy opt-out and disabled recording make no upload requests
 
 test('artifact configuration cannot export credential, Git or dependency directories',()=>{const {loadNativeConfig}=require('../../dist/ci/config');const root=temp();try{for(const artifactsDir of ['.flowstride','.git/evidence','node_modules/evidence']){fs.writeFileSync(path.join(root,'flowstride.config.json'),JSON.stringify({artifactsDir}));assert.throws(()=>loadNativeConfig(root,{}),/artifactsDir/);}}finally{cleanup(root);}});
 
-test('init keeps generated private evidence out of Git and rejects linked ignore files',async()=>{const vm=require('node:vm'),ts=require('typescript');const root=temp();try{const source=fs.readFileSync(path.join(__dirname,'../../src/cli/commands/init.ts'),'utf8'),module={exports:{}};const chalk=require('chalk');const deps={fs,path,chalk,ora:()=>({start(){return this;},succeed(){},fail(){},stop(){}}),child_process:{execFileSync(){},execFile(){}},util:{promisify:()=>async()=>({stdout:''})}};vm.runInNewContext(ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,esModuleInterop:true}}).outputText,{module,exports:module.exports,require:Object.assign(name=>{assert(name in deps,name);return deps[name];},{resolve:require.resolve}),console:{log(){}},process:{cwd:()=>root,env:{},execPath:process.execPath,platform:process.platform}});fs.writeFileSync(path.join(root,'.gitignore'),'# user rule\nnode_modules\n');await module.exports.initAction();await module.exports.initAction();const ignore=fs.readFileSync(path.join(root,'.gitignore'),'utf8');assert(ignore.startsWith('# user rule'));for(const rule of ['.flowstride','flowstride-artifacts','reports/latest'])assert.equal(ignore.split('\n').filter(line=>line===rule).length,1,rule);fs.unlinkSync(path.join(root,'.gitignore'));const sentinel=path.join(root,'sentinel');fs.writeFileSync(sentinel,'unchanged');fs.symlinkSync(sentinel,path.join(root,'.gitignore'));await assert.rejects(module.exports.initAction(),/linked|special/);assert.equal(fs.readFileSync(sentinel,'utf8'),'unchanged');}finally{cleanup(root);}});
+test('init keeps generated private evidence out of Git and rejects linked ignore files', async () => {
+  const vm = require('node:vm');
+  const ts = require('typescript');
+  const root = temp();
+  try {
+    const source = fs.readFileSync(path.join(__dirname, '../../src/cli/commands/init.ts'), 'utf8');
+    const module = { exports: {} };
+    const dependencies = {
+      'node:fs': fs,
+      'node:path': path,
+      '../../practice/project': require('../../dist/practice/project'),
+      '../utils/install_browsers': { installBrowsers() {} },
+    };
+    const { outputText } = ts.transpileModule(source, {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, esModuleInterop: true },
+    });
+    vm.runInNewContext(outputText, {
+      module, exports: module.exports,
+      require(name) { assert.ok(Object.hasOwn(dependencies, name), name); return dependencies[name]; },
+      console: { log() {} },
+      process: { cwd: () => root },
+    });
+    const ignoreFile = path.join(root, '.gitignore');
+    fs.writeFileSync(ignoreFile, '# user rule\nnode_modules\n');
+    await module.exports.initAction();
+    await module.exports.initAction();
+    const ignore = fs.readFileSync(ignoreFile, 'utf8');
+    assert.ok(ignore.startsWith('# user rule'));
+    for (const rule of ['.flowstride', 'flowstride-artifacts', 'reports/latest']) {
+      assert.equal(ignore.split('\n').filter(line => line === rule).length, 1, rule);
+    }
+    fs.unlinkSync(ignoreFile);
+    const sentinel = path.join(root, 'sentinel');
+    fs.writeFileSync(sentinel, 'unchanged');
+    fs.symlinkSync(sentinel, ignoreFile);
+    await assert.rejects(module.exports.initAction(), /linked|special/);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'unchanged');
+  } finally {
+    cleanup(root);
+  }
+});

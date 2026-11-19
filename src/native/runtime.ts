@@ -41,6 +41,10 @@ export class NativeRuntime {
     const generation=++this.assertionGeneration;
     const report:AssertionReporter=result=>{if(generation===this.assertionGeneration)this.lastAssertion=result;};
     const [area, action, extra] = command.split('.');
+    if (this.config.protectedHandoff && (['trace', 'visual', 'download'].includes(area!) ||
+        area === 'a11y' && action !== 'match')) {
+      throw new Error('Artifact capture is disabled in a handoff run.');
+    }
     if (!action || extra) throw new Error(`Unknown native command: flow.${command}`);
     if (this.web.hasFrameScope?.() && ['clock','component'].includes(area)) throw new Error(`flow.${command} is page-level. Use flow.frame.main {} before running it; it cannot silently escape the selected iframe.`);
     if (area === 'browser') {

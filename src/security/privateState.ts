@@ -102,16 +102,31 @@ export function ensurePrivateDirectory(root: string, relative = '') {
   return current;
 }
 export function readPrivateState(root: string, relative: string, limit = MAX_STATE): string | undefined {
+  return readPrivateStateBytes(root, relative, limit)?.toString('utf8');
+}
+
+export function readPrivateStateBytes(root: string, relative: string, limit = MAX_STATE): Buffer | undefined {
   const file = privateStatePath(root, relative), info = stat(file);
   if (!info) return undefined;
   ensurePrivateDirectory(root, path.posix.dirname(relative) === '.' ? '' : path.posix.dirname(relative));
   owned(info, file, false);
-  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0));
   try {
     const opened = fs.fstatSync(fd); owned(opened, file, false);
+    if ((process.platform !== 'win32' && opened.dev !== info.dev) || opened.ino !== info.ino || privateStatePath(root, relative) !== file) {
+      throw new PrivateStateError('Private state changed while opening.');
+    }
     if (opened.size > limit) throw new PrivateStateError(`Private-state file exceeds ${limit} bytes: ${file}`);
     if (process.platform === 'win32') restrictWindowsPath(file, false); else { if ((opened.mode & 0o7777) !== 0o600) fs.fchmodSync(fd, 0o600); clearMacAcl(file, fs.lstatSync(file)); }
-    return fs.readFileSync(fd, 'utf8');
+    const bytes = Buffer.alloc(opened.size + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (!count) break;
+      offset += count;
+    }
+    if (offset !== opened.size) throw new PrivateStateError('Private state changed while reading.');
+    return bytes.subarray(0, offset);
   } finally { fs.closeSync(fd); }
 }
 export function writePrivateState(root: string, relative: string, data: string | Buffer) {

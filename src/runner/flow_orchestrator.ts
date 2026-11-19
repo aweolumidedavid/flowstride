@@ -1,3 +1,10 @@
+import { serveRunHistory } from '../reporting/run_history_server';
+import { protectHandoffEvidence } from '../native/handoff';
+import { isBundledPracticeHandoff } from '../practice/project';
+import { serveLocalVideo } from '../reporting/local_video';
+import { CLEANUP_BUDGET_MS } from '../native/scenario_cleanup';
+import { FIXTURE_CANCEL_GRACE_MS } from './project_fixture';
+import { HandoffCoordinator, type HandoffStatus } from './handoff_coordinator';
 import { isPauseId, PauseState } from './execution_control';
 import { DashboardBrowser } from '../native/dashboard';
 import { serveDOMSnapshot } from '../native/evidence';
@@ -14,6 +21,9 @@ import { FlowWorker } from "./flow_worker";
 import { FlowstrideConfig } from "../types";
 import { PdfGenerator } from "../reporting/pdf_generator";
 
+// Scenario, file, handoff and worker callbacks can each have work to finish.
+const HANDOFF_STOP_GRACE_MS = FIXTURE_CANCEL_GRACE_MS + 4 * CLEANUP_BUDGET_MS + 2500;
+
 export class FlowOrchestrator {
   public static readonly nativeBrowserProtocol = 2;
   public static readonly nativeAssertionProtocol = 1;
@@ -24,6 +34,9 @@ export class FlowOrchestrator {
   public static readonly nativeBrowsingProtocol = 1;
   public static readonly nativeDataProtocol = 1;
   public static readonly nativeWorkflowProtocol = 1;
+  public static readonly nativeHelperProtocol = 1;
+  public static readonly nativeFixtureProtocol = 1;
+  public static readonly nativeHandoffProtocol = 1;
   public static readonly nativeApiProtocol = 1;
   public static readonly nativeApplicationEvidenceProtocol = 1;
   public readonly nativeEventProtocol = 1;
@@ -37,6 +50,7 @@ export class FlowOrchestrator {
   private dashboardBrowser = new DashboardBrowser();
   private closing = false;
   private browserInfoByFile = new Map<string, any>();
+  private localVideos = new Set<string>();
   private isExecuting = false;
   private pendingPauses = new Map<string, { payload: PauseState; owner?: never }>();
 
@@ -70,7 +84,16 @@ export class FlowOrchestrator {
     }
     if (type === 'SUITE_START' || type === 'RUN_COMPLETE') this.pendingPauses.clear();
     if (type === 'BROWSER_INFO') this.browserInfoByFile.set(payload.fileName, payload);
-    if (type === 'SUITE_START') this.browserInfoByFile.clear();
+    if (type === 'LOCAL_VIDEO_READY' && typeof payload?.fileName === 'string') this.localVideos.add(payload.fileName);
+    if (type === 'SUITE_START') {
+      this.browserInfoByFile.clear();
+      this.localVideos.clear();
+      this.dependencyStates.clear();
+    }
+    if (type === 'FLOW_DEPENDENCY') {
+      if (payload.status === 'ready') this.dependencyStates.delete(payload.fileName);
+      else this.dependencyStates.set(payload.fileName, payload);
+    }
     this.config?.onRunEvent?.({ type, payload });
     if (this.wss) {
       this.wss.clients.forEach((client) => {
@@ -81,16 +104,20 @@ export class FlowOrchestrator {
   }
 
   private activeExecution?: Promise<boolean>;
+  private handoffCoordinator?: HandoffCoordinator;
+  private dependencyStates = new Map<string, HandoffStatus>();
 
   private async stopDashboardRun(): Promise<void> {
     this.abort();
     const execution = this.activeExecution;
-    await this.worker.shutdown();
+    const dependencyRun = !!this.handoffCoordinator;
+    if (!dependencyRun || !execution) await this.worker.shutdown();
     if (!execution) return;
     await Promise.race([
       execution.catch(() => false),
-      new Promise<void>(resolve => setTimeout(resolve, 5500).unref()),
+      new Promise<void>(resolve => setTimeout(resolve, dependencyRun ? HANDOFF_STOP_GRACE_MS : 5500).unref()),
     ]);
+    if (dependencyRun) await this.worker.shutdown();
   }
 
   private async executeTestRun(targetPath: string) {
@@ -110,8 +137,9 @@ export class FlowOrchestrator {
     this.forwardToDashboard("SUITE_START", {});
 
     if(this.config && !this.config.ci) delete this.config.nativeDataManifest;
-    const filesToProcess = executionPlan(targetPath, this.config).files;
-    if (this.config) this.config.flowRoot = fs.statSync(targetPath).isDirectory() ? targetPath : path.dirname(targetPath);
+    const plan = executionPlan(targetPath, this.config);
+    const filesToProcess = plan.files;
+    if (this.config) this.config.flowRoot = plan.flowRoot;
 
     this.globalTestScenarios = [];
     this.stepStatusRegistry.clear();
@@ -146,8 +174,17 @@ export class FlowOrchestrator {
     this.worker.on("worker_event", listener);
 
     let passed = false;
-    try { passed = await this.worker.runBatch(filesToProcess); }
-    finally { this.worker.off("worker_event", listener); }
+    try {
+      if (plan.handoffs?.length && this.config) {
+        const restore = protectHandoffEvidence(this.config, isBundledPracticeHandoff(this.config, plan.handoffs));
+        const coordinator = new HandoffCoordinator(plan.handoffs, plan.flowRoot, event => this.forwardToDashboard('FLOW_DEPENDENCY', event));
+        this.handoffCoordinator = coordinator;
+        try { passed = await this.worker.runBatch(filesToProcess, coordinator.source('main')) && !coordinator.failed; }
+        finally { coordinator.clear(); this.handoffCoordinator = undefined; restore(); }
+      } else {
+        passed = await this.worker.runBatch(filesToProcess);
+      }
+    } finally { this.worker.off("worker_event", listener); }
     this.forwardToDashboard("RUN_COMPLETE", { status: passed ? 'success' : 'failed' });
     return passed;
   }
@@ -159,80 +196,11 @@ export class FlowOrchestrator {
         if (!isLocalDashboardRequest(req.headers.host, req.headers.origin)) { res.writeHead(403); res.end('Forbidden'); return; }
           res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
           if (serveDOMSnapshot(req, res, this.config)) return;
+          if (serveRunHistory(req, res, this.config?.projectRoot || process.cwd(), this.config?.artifactsDir)) return;
 
-        if (req.url && req.url.startsWith("/videos/")) {
-          res.setHeader("Cache-Control", "private, no-store");
-          res.setHeader("X-Content-Type-Options", "nosniff");
-          res.setHeader("Referrer-Policy", "no-referrer");
-          let urlObj;
-          try {
-            urlObj = new URL(req.url, `http://${req.headers.host}`);
-          } catch (err) {
-            res.writeHead(400);
-            return res.end("Bad Request");
-          }
-
-          const rawVideoName = decodeURIComponent(
-            urlObj.pathname.replace("/videos/", ""),
-          );
-          const videoName = path.basename(rawVideoName);
-
-          if (!videoName || videoName === "/" || videoName === ".") {
-            res.writeHead(400);
-            return res.end("Invalid video requested");
-          }
-
-          const videoPath = path.join(
-            process.cwd(),
-            ".flowstride",
-            "mock-cloud",
-            videoName,
-          );
-
-          if (fs.existsSync(videoPath)) {
-              const info = fs.lstatSync(videoPath);
-              if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1) { res.writeHead(404); res.end('Video unavailable'); return; }
-            const stat = fs.statSync(videoPath);
-            const fileSize = stat.size;
-
-            if (fileSize === 0) {
-              res.writeHead(200, {
-                "Content-Length": 0,
-                "Content-Type": "video/webm",
-              });
-              return res.end();
-            }
-
-            const range = req.headers.range;
-
-            if (range) {
-              const parts = range.replace(/bytes=/, "").split("-");
-              const start = parseInt(parts[0], 10);
-              const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-              const chunksize = end - start + 1;
-              const file = fs.createReadStream(videoPath, { start, end });
-              const head = {
-                "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-                "Accept-Ranges": "bytes",
-                "Content-Length": chunksize,
-                "Content-Type": "video/webm",
-              };
-              res.writeHead(206, head);
-              file.pipe(res);
-            } else {
-              const head = {
-                "Content-Length": fileSize,
-                "Content-Type": "video/webm",
-              };
-              res.writeHead(200, head);
-              fs.createReadStream(videoPath).pipe(res);
-            }
-          } else {
-            res.writeHead(404);
-            res.end("Video not found");
-          }
-        } else {
-          const uiDistPath = path.join(__dirname, "../../src/ui/dist");
+          if (serveLocalVideo(req, res, this.config?.projectRoot || process.cwd(), this.localVideos)) return;
+          {
+            const uiDistPath = path.join(__dirname, "../../src/ui/dist");
 
           let reqPath =
             req.url === "/"
@@ -299,7 +267,9 @@ export class FlowOrchestrator {
 
       this.wss.on("connection", (ws) => {
         for (const payload of this.browserInfoByFile.values()) ws.send(JSON.stringify({ type: 'BROWSER_INFO', payload }));
+        for (const fileName of this.localVideos) ws.send(JSON.stringify({ type: 'LOCAL_VIDEO_READY', payload: { fileName } }));
         for (const { payload } of this.pendingPauses.values()) ws.send(JSON.stringify({ type: 'EXECUTION_PAUSED', payload }));
+        for (const payload of this.dependencyStates.values()) ws.send(JSON.stringify({ type: 'FLOW_DEPENDENCY', payload }));
         if (this.disconnectTimer) {
           clearTimeout(this.disconnectTimer);
           this.disconnectTimer = null;
@@ -431,6 +401,7 @@ export class FlowOrchestrator {
 
   public abort() {
     this.pendingPauses.clear();
+    this.handoffCoordinator?.cancel('Execution was interrupted before this file could start.');
     this.worker.abort();
   }
 

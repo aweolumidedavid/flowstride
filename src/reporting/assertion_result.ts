@@ -71,6 +71,9 @@ export function failedAssertion(result: AssertionResult | undefined, reason: str
   return copy;
 }
 export function commandLabel(action: string, payload: any): string {
+  if (action === 'helper') return 'flow.call';
+  if (action === 'handoff') return payload?.kind === 'publish' ? 'flow.handoff.publish' : 'flow.handoff.receive';
+  if (action === 'fixture') return payload?.scope === 'worker' ? 'flow.fixture.worker' : 'flow.fixture.use';
   return action === 'native' && typeof payload?.pluginMethod === 'string' ? 'flow.' + payload.pluginMethod
     : action === 'plugin' && typeof payload?.pluginAlias === 'string' ? payload.pluginAlias + '.' + payload.pluginMethod : action;
 }

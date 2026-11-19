@@ -1,3 +1,6 @@
+import { startPracticeRun } from '../practice/server';
+import { archiveNativeRun } from '../reporting/native_history';
+import type { HandoffStatus } from '../runner/handoff_coordinator';
 import { redactText } from '../security/redaction';
 import { evidenceDirectory, writeEvidence, protectEvidenceTree, exportEvidence } from '../security/evidence';
 import { assertionText } from '../reporting/assertion_result';
@@ -12,16 +15,25 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Lexer } from '../parser/lexer';
 import { Parser } from '../parser/parser';
 import type { FlowstrideConfig } from '../types';
+import type { FixtureCleanup } from '../native/scenario_cleanup';
+
+export interface FixtureCleanupResult extends FixtureCleanup {
+  status: 'passed' | 'failed';
+  error?: string;
+}
 
 export interface NativeRunResult {
   protocol: 1; engine: string; status: 'passed' | 'failed' | 'interrupted' | 'skipped';
   duration: number; artifactsDir: string; files: string[]; steps: any[]; errors: string[];
+  fixtureCleanups?: FixtureCleanupResult[];
+  dependencies?: HandoffStatus[];
   metrics: { total: number; passed: number; failed: number; skipped: number; incomplete: number };
 }
 function safeName(name: string) { return name.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0,120) + '-' + createHash('sha256').update(name).digest('hex').slice(0,12); }
 function xml(value: unknown) { return String(value).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').replace(/[<>&"']/g, char => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[char]!)); }
-export async function runNativeCI(worker: any, orchestrator: any, target: string, config: FlowstrideConfig, engine: string): Promise<NativeRunResult> {
+export async function runNativeCI(worker: any, orchestrator: any, target: string, config: FlowstrideConfig, engine: string, practice = false): Promise<NativeRunResult> {
   const started = Date.now();
+  let stopPractice: (() => Promise<void>) | undefined;
   delete config.nativeDataManifest;
   const artifactRoot = config.artifactsDir!;
   evidenceDirectory(config, artifactRoot);
@@ -32,6 +44,8 @@ export async function runNativeCI(worker: any, orchestrator: any, target: string
   const browsers = new Map<string, any>();
   const attempts: any[] = []; const attemptSteps = new Map<string, any[]>(); const timings: Record<string,number> = {};
   const steps = new Map<string, any>(); const completed = new Set<string>(); const errors: string[] = [];
+  const fixtureCleanups: FixtureCleanupResult[] = [];
+  const dependencies: HandoffStatus[] = [];
   const planned = new Map<string, any>(); let bailed = false;
   let hasRunnableScenario = false;
   let expected = 0; let files: string[] = []; let server: ChildProcess | undefined; let interrupted = false;
@@ -61,7 +75,21 @@ export async function runNativeCI(worker: any, orchestrator: any, target: string
     if (data.type === 'FILE_FAILED' && ![...steps.values()].some(step => step.fileName === p.fileName && step.status === 'failed')) errors.push(`${p.fileName}: ${p.error || 'Execution failed'}`);
     if (data.type === 'BROWSER_ERROR' && config.browserErrors !== 'record') errors.push(`Browser: ${p.message}`);
     if (data.type === 'CLOUD_SYNC') config.cloudSyncResult = p;
+    if (data.type === 'FLOW_DEPENDENCY') {
+      dependencies.push(p);
+      if (p.status === 'blocked') {
+        completed.add(p.fileName);
+        errors.push(p.fileName + ': ' + p.reason);
+        for (const [key, step] of planned) if (step.fileName === p.fileName) {
+          steps.set(key, { ...step, reason: undefined, status: 'blocked', skipReason: p.reason, userMessage: p.reason });
+        }
+      }
+    }
     if (data.type === 'WORKER_ERROR') errors.push(p.message || 'Worker failed');
+    if (data.type === 'FIXTURE_CLEANUP') {
+      fixtureCleanups.push(p);
+      if (p.status === 'failed') errors.push(`${p.fileName}:${p.sourceLine}: ${p.error}`);
+    }
   };
   // Modern orchestrators forward child-process events here; the worker listener
   // also supports older compatible Pro packages. Step maps make duplicates harmless.
@@ -71,10 +99,11 @@ export async function runNativeCI(worker: any, orchestrator: any, target: string
   try {
     plan = executionPlan(target, config);
     files = plan.files;
-    config.flowRoot = fs.statSync(target).isDirectory() ? target : path.dirname(target);
+    config.flowRoot = plan.flowRoot;
     if (!plan.allFiles.length) throw new Error('No .flow tests found.');
+    const handoffFeatures = new Map(plan.handoffs?.map(job => [job.file, job.features]));
     for (const file of files) {
-      const features = prepareWorkflowFeatures(new Parser(new Lexer(fs.readFileSync(file, 'utf8')).tokenise()).parse(), config);
+      const features = handoffFeatures.get(file) ?? prepareWorkflowFeatures(new Parser(new Lexer(fs.readFileSync(file, 'utf8')).tokenise()).parse(), config);
       hasRunnableScenario ||= features.some(feature => feature.scenarios.some(scenario => !scenario.skipReason && scenario.steps.length));
       for (const feature of features) for (const scenario of feature.scenarios) for (const step of scenario.steps) {
         const fileName = flowIdentity(file, config.flowRoot);
@@ -83,7 +112,9 @@ export async function runNativeCI(worker: any, orchestrator: any, target: string
       expected += features.reduce((n: number, feature: any) => n + feature.scenarios.reduce((m: number, scenario: any) => m + scenario.steps.length, 0), 0);
     }
     if (files.length && !expected) throw new Error('No executable test steps found.');
-    if (config.webServer && hasRunnableScenario) {
+    if (practice && hasRunnableScenario) {
+      stopPractice = await startPracticeRun(config);
+    } else if (!practice && config.webServer && hasRunnableScenario) {
       const settings = config.webServer;
       const probe = async () => { try { return (await fetch(settings.url, { signal: AbortSignal.timeout(1000) })).ok; } catch { return false; } };
       if (await probe()) throw new Error('webServer readiness URL is already serving; refusing to test an unowned server.');
@@ -123,25 +154,27 @@ export async function runNativeCI(worker: any, orchestrator: any, target: string
       // Terminate remaining descendants even if the shell exited first.
       stop('SIGKILL');
     }
+    try { await stopPractice?.(); }
+    catch { errors.push('Could not shut down the local practice app.'); }
     worker.off('worker_event', event); delete config.onRunEvent;
     process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
   }
   if (interrupted) errors.push('Run interrupted.');
   if (bailed) for (const [key, step] of planned) if (!steps.has(key)) steps.set(key, step);
   const results = [...steps.values()];
-  const terminal = results.filter(step => ['passed','failed','skipped','not_tested'].includes(step.status));
+  const terminal = results.filter(step => ['passed','failed','skipped','not_tested','blocked'].includes(step.status));
   const incomplete = Math.max(0, expected - terminal.length);
   for (const file of files) if (!bailed && !completed.has(flowIdentity(file, config.flowRoot))) errors.push(`Incomplete file: ${flowIdentity(file, config.flowRoot)}`);
-  if (results.some(step => !['passed','failed','skipped','not_tested'].includes(step.status))) errors.push('Unfinished test steps.');
+  if (results.some(step => !['passed','failed','skipped','not_tested','blocked'].includes(step.status))) errors.push('Unfinished test steps.');
   if (terminal.length > expected) errors.push('Engine produced an unexpected step count.');
   const metrics = { total: expected, passed: results.filter(s => s.status === 'passed').length,
-    failed: results.filter(s => s.status === 'failed').length, skipped: results.filter(s => ['skipped','not_tested'].includes(s.status)).length, incomplete };
+    failed: results.filter(s => s.status === 'failed').length, skipped: results.filter(s => ['skipped','not_tested','blocked'].includes(s.status)).length, incomplete };
   if (config.failOnFlaky && attempts.some(attempt => attempt.flaky)) errors.push('Flaky scenarios are configured to fail CI.');
   const result: NativeRunResult & { cloudSync?: unknown; attempts?: any[]; timings?: Record<string,number>; distribution?: unknown } = { cloudSync: config.cloudSyncResult, browser: config.browser || 'chromium', browsers: [...browsers.values()], protocol: 1, engine, status: interrupted ? 'interrupted' : errors.length || metrics.failed || incomplete ? 'failed' : results.length && results.every(step => step.skipReason) ? 'skipped' : 'passed',
-    duration: Date.now() - started, artifactsDir: directory, files: files.map(file => flowIdentity(file, config.flowRoot)), steps: results, errors, metrics, attempts, timings, distribution: { ...plan, files: undefined, flowRoot: undefined } } as any;
+    duration: Date.now() - started, artifactsDir: directory, files: files.map(file => flowIdentity(file, config.flowRoot)), steps: results, errors, ...(fixtureCleanups.length && { fixtureCleanups }), ...(dependencies.length && { dependencies }), metrics, attempts, timings, distribution: { ...plan, handoffs: undefined, files: undefined, flowRoot: undefined } } as any;
   // Existing workers finalize videos into these locations. Copy only run files,
   // never the project directory or credentials.
-  if (config.recordVideo !== false) for (const file of files) {
+  if (!plan?.handoffs && config.recordVideo !== false) for (const file of files) {
     for (const folder of ['artifacts','mock-cloud']) {
       const video = path.join(process.cwd(), '.flowstride', folder, videoFileName(flowIdentity(file, config.flowRoot)));
       if (fs.existsSync(video) && fs.statSync(video).mtimeMs >= started) {
@@ -153,8 +186,9 @@ export async function runNativeCI(worker: any, orchestrator: any, target: string
   protectEvidenceTree(config, directory);
   config.artifactsDir = artifactRoot;
   fs.writeFileSync(path.join(artifactRoot, 'timings.json'), JSON.stringify(timings, null, 2));
-  fs.writeFileSync(path.join(artifactRoot, 'summary.json'), JSON.stringify(exportEvidence(result), null, 2));
-  const cases = results.map(step => `<testcase classname="${xml(step.fileName)}" name="${xml(step.description || step.id)}">${step.status === 'failed' ? `<failure message="${xml(step.error || 'Test step failed')}"/>` : ['skipped','not_tested'].includes(step.status) ? step.skipReason ? `<skipped message="${xml(step.skipReason)}"/>` : '<skipped/>' : ''}${step.assertion || step.userMessage ? `<system-out>${xml(step.assertion ? assertionText(step.assertion) : step.userMessage)}</system-out>` : ''}</testcase>`);
+  const portableReport = exportEvidence(result);
+  fs.writeFileSync(path.join(artifactRoot, 'summary.json'), JSON.stringify(portableReport, null, 2));
+  const cases = results.map(step => `<testcase classname="${xml(step.fileName)}" name="${xml(step.description || step.id)}">${step.status === 'failed' ? `<failure message="${xml(step.error || 'Test step failed')}"/>` : ['skipped','not_tested','blocked'].includes(step.status) ? step.skipReason ? `<skipped message="${xml(step.skipReason)}"/>` : '<skipped/>' : ''}${step.assertion || step.userMessage ? `<system-out>${xml(step.assertion ? assertionText(step.assertion) : step.userMessage)}</system-out>` : ''}</testcase>`);
   for (const error of errors) cases.push(`<testcase name="execution"><error message="${xml(error)}"/></testcase>`);
   if (incomplete) cases.push(`<testcase name="completion"><failure message="${incomplete} incomplete steps"/></testcase>`);
   fs.writeFileSync(path.join(artifactRoot, 'junit.xml'), `<?xml version="1.0"?><testsuite name="Flowstride" tests="${cases.length}" failures="${metrics.failed + (incomplete ? 1 : 0)}" errors="${errors.length}" skipped="${metrics.skipped}">${cases.join('')}</testsuite>`);
@@ -165,5 +199,7 @@ export async function runNativeCI(worker: any, orchestrator: any, target: string
     if (failures.length) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY,'\n'+failures.join('\n')+'\n');
   }
   protectEvidenceTree(config, artifactRoot);
+  try { archiveNativeRun(config.projectRoot || process.cwd(), portableReport, started); }
+  catch { console.warn('[Flowstride] Could not save this run to local history.'); }
   return result;
 }
