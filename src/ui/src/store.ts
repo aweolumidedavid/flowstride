@@ -423,18 +423,8 @@ export const useFlowStore = create<AppState>((set) => ({
           attemptHistory: history,
         };
 
-        const hasFailed = updatedSteps.some((s) => s.status === "failed");
-        const allPassed = aggregateStepStatus(updatedSteps) === "passed";
-
-        let newScenarioStatus = scenario.status;
-        if (hasFailed) newScenarioStatus = "failed";
-        else if (allPassed) newScenarioStatus = "pass";
-
-        return {
-          ...scenario,
-          status: newScenarioStatus,
-          steps: updatedSteps,
-        };
+        // Steps arrive one at a time. The runner reports the scenario outcome after cleanup.
+        return { ...scenario, steps: updatedSteps };
       });
 
       if (!updated) return state;

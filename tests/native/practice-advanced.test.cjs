@@ -107,18 +107,23 @@ test('One scenario creates and approves a user through the API and signs in as t
   await closed(await invocation.ready());
 });
 
-test('The advanced live dashboard shows waiting, per-step screenshots and protected cleanup', { timeout: 60000 }, async t => {
+test('The advanced live dashboard shows waiting, per-step screenshots and protected cleanup', { timeout: 120000 }, async t => {
   const f = workspace(t);
   preparePracticeProject(f.dir, false);
-  const invocation = launch(t, f, ['run', advanced, ...(privateEngine ? ['--workers', '2'] : [])], captureDashboardLaunch(f), 50000);
+  const invocation = launch(t, f, ['run', advanced, ...(privateEngine ? ['--workers', '2'] : [])], captureDashboardLaunch(f), 110000);
   const app = await invocation.ready();
   const dashboard = await invocation.outputMatch(/\[Test dashboard\] (http:\/\/localhost:\d+)/);
   const browser = await chromium.launch();
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     const events = [];
+    const runComplete = Promise.withResolvers();
     page.on('websocket', socket => {
-      socket.on('framereceived', ({ payload }) => events.push(JSON.parse(String(payload))));
+      socket.on('framereceived', ({ payload }) => {
+        const event = JSON.parse(String(payload));
+        events.push(event);
+        if (event.type === 'RUN_COMPLETE') runComplete.resolve(event.payload.status);
+      });
     });
     await page.goto(dashboard);
     const adminRow = page.locator('[data-flow-result="' + admin + '"]');
@@ -128,8 +133,25 @@ test('The advanced live dashboard shows waiting, per-step screenshots and protec
     await waiting.getByText('Waiting for ' + admin, { exact: true }).waitFor({ timeout: 5000 });
     assert.equal(await adminRow.isVisible(), true);
 
-    await adminRow.and(page.locator('[data-flow-status="passed"]')).waitFor({ timeout: 20000 });
-    await memberRow.and(page.locator('[data-flow-status="passed"]')).waitFor({ timeout: 20000 });
+    // The admin retries before the handoff. Compare the rendered result once the runner finishes.
+    try {
+      const status = await Promise.race([
+        runComplete.promise,
+        invocation.finished.then(() => 'CLI exited before RUN_COMPLETE'),
+        delay(80000, 'Timed out waiting for RUN_COMPLETE', { ref: false }),
+      ]);
+      assert.equal(status, 'success');
+      for (const row of [adminRow, memberRow]) {
+        await row.and(page.locator('[data-flow-status="passed"]')).waitFor({ timeout: 5000 });
+      }
+    } catch (error) {
+      const outcomes = events
+        .filter(event => ['SCENARIO_RESULT', 'FLOW_DEPENDENCY', 'RUN_COMPLETE'].includes(event.type))
+        .map(({ type, payload }) => [type, payload.fileName, payload.attempt, payload.status]);
+      const rows = await page.locator('[data-flow-result]').evaluateAll(elements =>
+        elements.map(row => [row.dataset.flowResult, row.dataset.flowStatus]));
+      throw new Error('Runner outcomes ' + JSON.stringify(outcomes) + '; dashboard rows ' + JSON.stringify(rows), { cause: error });
+    }
     await page.getByRole('button', { name: 'Run', exact: true }).waitFor();
     for (const file of [admin, catalog, member]) {
       assert.ok(events.some(event => event.type === 'BROWSER_FRAME' &&
