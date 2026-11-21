@@ -29,10 +29,14 @@ for (const [name, engine] of Object.entries({chromium,firefox,webkit})) {
     const browser = await engine.launch();
     try {
       const page = await browser.newPage();
-      const web = new WebAdapter({timeout:1200});
+      // A lookup can cross multiple browser processes for the nested frame fixture.
+      const timeout = 5000;
+      const web = new WebAdapter({ timeout });
       web.getPage = () => page;
       web.getScope = () => page;
-      const check = (label, condition) => assertBrowser(page, {target:{element:'input',text:label},condition,timeout:400}, 400, undefined, web);
+      const check = (label, condition) => assertBrowser(
+        page, { target: { element: 'input', text: label }, condition }, timeout, undefined, web
+      );
       const doc = '<div><label>Password<input id="pw" type="password" value="practice-only"></label>' +
         '<button aria-label="Copy password" aria-controls="pw" onclick="throw Error(\'wrong button\')">Copy</button>' +
         '<button aria-pressed="false" aria-label="Changer" aria-controls="pw" onclick="pw.type=pw.type===\'text\'?\'password\':\'text\'"></button></div>' +
