@@ -4,7 +4,12 @@ const html=`<!doctype html><html><head><title>Browser interaction lab</title><st
 async function fixture(browser='chromium'){
  const directory=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'flowstride-batch3-cli-')));fs.mkdirSync(path.join(directory,'flows'));fs.mkdirSync(path.join(directory,'.flowstride'));fs.writeFileSync(path.join(directory,'.flowstride/credentials.json'),'{}');const requests=[];
  const server=http.createServer((req,res)=>{requests.push(req.url);if(req.url.startsWith('/api/')){res.setHeader('Content-Type','application/json');if(req.url==='/api/auth/verify-cli')res.end(JSON.stringify({tier:'business',workspaceName:'Batch3 fixture'}));else if(req.url==='/api/workspace/status')res.end(JSON.stringify({workspace:{_id:'fixture-batch3-workspace'},manifest:{maxWorkers:2,features:[]}}));else{req.resume();res.end(JSON.stringify({accepted:true}));}return;}res.setHeader('Content-Type','text/html');res.end(html);});await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));const url='http://127.0.0.1:'+server.address().port;
- fs.writeFileSync(path.join(directory,'flowstride.config.json'),JSON.stringify({baseUrl:url,browser,timeout:750,recordVideo:false,domSnapshots:false,security:{evidence:{screenshots:false}}}));
+ // Browser and driver round trips share each step's deadline on hosted runners.
+ const config = {
+   baseUrl: url, browser, timeout: 5000, recordVideo: false, domSnapshots: false,
+   security: { evidence: { screenshots: false } },
+ };
+ fs.writeFileSync(path.join(directory, 'flowstride.config.json'), JSON.stringify(config));
  return {directory,url,requests,write:source=>fs.writeFileSync(path.join(directory,'flows/interactions.flow'),source),summary:()=>JSON.parse(fs.readFileSync(path.join(directory,'flowstride-artifacts/summary.json'))),close:async()=>{server.closeAllConnections();await new Promise(resolve=>server.close(resolve));fs.rmSync(directory,{recursive:true,force:true});}};
 }
 async function execute(f,args=[],extra={}){return new Promise((resolve,reject)=>{const child=spawn(process.execPath,[path.join(root,'dist/cli/index.js'),'run','flows','--ci',...args],{cwd:f.directory,env:{PATH:process.env.PATH,TMPDIR:os.tmpdir(),CI:'true',FLOWSTRIDE_TOKEN:'',FLOWSTRIDE_API_URL:f.url,...extra},stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',d=>output+=d);child.stderr.on('data',d=>output+=d);const timer=setTimeout(()=>{child.kill('SIGKILL');reject(Error('Batch3 CLI timeout: '+output));},60000);child.on('error',reject);child.once('exit',(code,signal)=>{clearTimeout(timer);resolve({code,signal,output});});});}
