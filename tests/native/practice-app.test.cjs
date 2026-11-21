@@ -265,10 +265,26 @@ test('The local catalog and admin forms support assigning a permission and signi
     await admin.goto(app.origin);
     await admin.getByRole('heading', { name: 'Car catalog' }).waitFor();
     assert.equal(await admin.locator('li[data-sku]').count(), 50);
+    const togglePassword = async (page, label, placeholder, value) => {
+      const input = page.getByLabel(label, { exact: true });
+      assert.equal(await input.getAttribute('placeholder'), placeholder);
+      assert.equal(await input.getAttribute('type'), 'password');
+      await input.fill(value);
+      const show = page.getByRole('button', { name: 'Show password', exact: true });
+      assert.equal(await show.getAttribute('aria-controls'), await input.getAttribute('id'));
+      assert.ok(await show.locator('svg').isVisible());
+      await show.focus();
+      await page.keyboard.press('Space');
+      assert.equal(await input.getAttribute('type'), 'text');
+      assert.equal(await input.inputValue(), value);
+      await page.getByRole('button', { name: 'Hide password', exact: true }).click();
+      assert.equal(await input.getAttribute('type'), 'password');
+      assert.equal(await input.inputValue(), value);
+    };
     const logIn = async (page, email, password) => {
       await page.goto(app.origin + '/login');
       await page.getByLabel('Email').fill(email);
-      await page.getByLabel('Password').fill(password);
+      await togglePassword(page, 'Password', 'Enter password', password);
       await page.getByRole('button', { name: 'Sign in' }).click();
       await page.getByRole('heading', { name: 'Your account' }).waitFor();
     };
@@ -276,7 +292,7 @@ test('The local catalog and admin forms support assigning a permission and signi
     await admin.getByRole('link', { name: 'Manage users' }).click();
     await admin.getByLabel('Full name').fill('QA Driver & Approver');
     await admin.getByLabel('User email').fill('approver@example.test');
-    await admin.getByLabel('Temporary password').fill('practice-approver');
+    await togglePassword(admin, 'Temporary password', 'Create a password', 'practice-approver');
     await admin.getByRole('button', { name: 'Create user' }).click();
     const row = admin.locator('.member').filter({ hasText: 'QA Driver & Approver' });
     await row.getByLabel('Role for QA Driver & Approver').selectOption('approver');

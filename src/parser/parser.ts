@@ -823,6 +823,21 @@ export class Parser {
       case "check":
       case "uncheck":
       case "hover":
+        if (action === 'click' && this.peek().type === TokenType.IDENTIFIER && this.peek().value.toLowerCase() === 'passtoggle') {
+          this.advance();
+          payload.elementType = 'passToggle';
+          if (this.peek().type === TokenType.NUMBER) payload.toggleIndex = Number(this.advance().value);
+          if (this.peek().type === TokenType.IDENTIFIER && this.peek().value.toLowerCase() === 'for') {
+            this.advance();
+            payload.selector = this.consume(TokenType.STRING, 'Expected a quoted password field label').value;
+            if (!payload.selector.trim()) throw new Error('passToggle requires a nonempty field label after for.');
+          } else if (this.peek().type === TokenType.IDENTIFIER || this.peek().type === TokenType.STRING) {
+            throw new Error(`Expected for and a quoted field label after passToggle at line ${this.peek().line}`);
+          } else {
+            payload.selector = '';
+          }
+          break;
+        }
         this.consumeOptionalElement(payload);
         if (["burger", "hamburger"].includes(payload.elementType)) {
           if (!this.isAtEnd() && this.peek().type === TokenType.STRING) {

@@ -50,6 +50,7 @@ const publicAccount = ({ id, name, email, role }: Account) => ({ id, name, email
 
 export async function startPracticeApp() {
   const css = fs.readFileSync(path.join(practiceBundle, 'style.css'));
+  const passwordVisibility = fs.readFileSync(path.join(practiceBundle, 'password-visibility.js'));
   const accounts = seedAccounts();
   const sessions = new Map<string, string>();
   const interruptedRoleSaves = new Set<string>();
@@ -95,7 +96,7 @@ export async function startPracticeApp() {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
-    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'self'; script-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
     const site = req.headers['sec-fetch-site'];
     if (req.headers.host !== host || (req.headers.origin && req.headers.origin !== origin) ||
         site === 'cross-site' || site === 'same-site') {
@@ -113,6 +114,9 @@ export async function startPracticeApp() {
     try {
       if (method === 'GET' && route === '/health') return json(res, 200, { status: 'ready' });
       if (method === 'GET' && route === '/styles.css') return res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8' }).end(css);
+      if (method === 'GET' && route === '/password-visibility.js') {
+        return res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' }).end(passwordVisibility);
+      }
       if (method === 'GET' && route === '/favicon.ico') return res.writeHead(204).end();
       if (method === 'GET' && (route === '/' || route === '/api/cars')) {
         const category = url.searchParams.get('category') || '';

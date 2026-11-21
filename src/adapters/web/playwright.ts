@@ -1,3 +1,4 @@
+import { clickPasswordToggle } from './password_toggle';
 import { settleUserAgentOverride } from './plugin_lifecycle';
 import { readableTargetSchema, type ReadableTarget } from '../../native/targeting';
 import { evidenceDirectory, protectEvidenceTree } from '../../security/evidence';
@@ -868,7 +869,11 @@ export class WebAdapter {
     return (await targetLoc.inputValue()) || "";
   }
 
-  public async click(selector: string, elementType?: string): Promise<void> {
+  public async click(selector: string, elementType?: string, toggleIndex?: number): Promise<void> {
+    if (elementType === 'passToggle') {
+      const scopes = () => this.hasFrameScope() ? [this.getScope()] : this.getPage().frames();
+      return clickPasswordToggle(scopes, selector, toggleIndex, this.config.timeout ?? 30000);
+    }
     const loc = await this.getLocator(selector, elementType, false, false);
 
     const targetLoc = await this.checkAmbiguity(loc, selector);
@@ -2158,7 +2163,7 @@ export class WebAdapter {
   }
 
   /** Readable assertion targets share the normal heuristic compiler, without action waits or first(). */
-  public async resolveAssertionTarget(input: ReadableTarget, frameSelector?: string, visibleOnly = false, explicitScope?: Page | Frame): Promise<Locator> {
+  public async resolveAssertionTarget(input: ReadableTarget, frameSelector?: string, visibleOnly = false, explicitScope?: Page | Frame, passwordTarget = false): Promise<Locator> {
     const parsed = readableTargetSchema.parse(input);
     const target: Exclude<ReadableTarget, string> = typeof parsed === 'string' ? { text: parsed } : parsed;
     const direction = (['near','above','under','below','leftOf','rightOf'] as const).find(key => target[key] !== undefined);
@@ -2185,8 +2190,10 @@ export class WebAdapter {
         if (count > 1) throw new Error(`Ambiguous inside anchor ${JSON.stringify(target.inside)}: ${count} matches. Use a more specific readable container or an explicit selector.`);
         container = anchor;
       }
-      let result = readable(container, target.text, target.element);
-      if (!target.element) {
+      let result = passwordTarget && (!target.element || ['input', 'field'].includes(target.element))
+        ? container.getByLabel(target.text, { exact: true }).or(container.getByPlaceholder(target.text, { exact: true })).and(container.locator('input'))
+        : readable(container, target.text, target.element);
+      if (!passwordTarget && !target.element) {
         const labelled = container.getByLabel(target.text, { exact: true });
         if (await labelled.count() > 0) result = labelled;
       }
@@ -2202,8 +2209,9 @@ export class WebAdapter {
     if (frameSelector) return resolve(scope.frameLocator(frameSelector));
     const main = await resolve(scope);
     if (explicitScope || this.hasFrameScope()) return main;
-    if (await main.count() > 0) return main;
-    const frames: Locator[] = [];
+    const hasMainMatch = await main.count() > 0;
+    if (hasMainMatch && !passwordTarget) return main;
+    const frames: Locator[] = hasMainMatch ? [main] : [];
     for (const frame of page.frames()) {
       if (frame === page.mainFrame()) continue;
       try {

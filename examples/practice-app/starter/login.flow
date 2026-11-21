@@ -3,6 +3,12 @@ Feature: Sign in to the practice app
 Scenario: A practice driver opens their account
   Given "The sign-in form is open"
     flow.open "/login";
+    flow.assert.that { "target": { "element": "input", "text": "Password" }, "condition": "masked" };
+  When "Show and hide the password field"
+    flow.click passToggle for "Password";
+    flow.assert.that { "target": { "element": "input", "text": "Password" }, "condition": "revealed" };
+    flow.click passToggle for "Password";
+    flow.assert.that { "target": { "element": "input", "text": "Password" }, "condition": "masked" };
   When "Sign in with the seeded driver account"
     flow.type input "Email" "driver@example.test";
     flow.passcode input "Password" "practice-driver";
