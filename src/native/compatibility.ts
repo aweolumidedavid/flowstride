@@ -95,6 +95,11 @@ export function needsNativeApplicationEvidenceProtocol(target: string, config: F
     step.action === 'native' && /^(?:console|channel|visual)\./.test(step.payload.pluginMethod));
 }
 
+export function needsNativePasswordToggleProtocol(target: string, config: FlowstrideConfig): boolean {
+  return usesNativeCommand(target, config, step => step.action === 'click' && step.payload.elementType === 'passToggle' ||
+    step.payload.pluginMethod === 'assert.that' && ['masked', 'revealed'].includes(step.payload.data?.condition));
+}
+
 export function needsNativeHelperProtocol(target: string, config: FlowstrideConfig): boolean {
   return discoverFlows(target, config.projectRoot || process.cwd()).some(file =>
     new Lexer(fs.readFileSync(file, 'utf8')).tokenise().some(token =>

@@ -78,6 +78,19 @@ Set `BASE_URL` directly in a project `.env` file when you want a common applicat
 
 Runtime commands include `flow.browser.offline` with `value`, `flow.browser.permissions` with `permissions` and optional `origin`, `flow.browser.clearPermissions`, and `flow.browser.geolocation` with latitude/longitude. Recording paths are controlled by evidence settings, rather than arbitrary browser path options. JavaScript logger callbacks are not JSON DSL settings.
 
+## Password visibility
+
+Use the label or placeholder of the password field. FS clicks its associated visibility control and checks the field's display state without reading its value.
+
+```flow
+flow.click passToggle for "Password";
+flow.assert.that { "target": { "element": "input", "text": "Password" }, "condition": "revealed" };
+flow.click passToggle for "Password";
+flow.assert.that { "target": { "element": "input", "text": "Password" }, "condition": "masked" };
+```
+
+The field lookup includes nested frames. If the same field is visible in multiple frames, select the intended frame first. Explicit control relationships, recognizable eye icons, and show/hide controls grouped with one field help FS identify the correct control. An ambiguous control produces an error. Choose a zero-based index when several controls match, for example `flow.click passToggle[1] for "Password";`. Without a field label, `flow.click passToggle[0];` selects the first candidate in the active frame or page search. Indexes count matching controls in field order and then control order within each field. For predictable indexing across repeated forms, select a frame or give a field label. When a password field has its own wrapper, a non-submitting icon button inside it can also identify its toggle. If several such buttons are equally plausible, FS lists the valid index range and requires an explicit choice. An out-of-range index fails without clicking. Use fictional passwords for demonstrations that record the screen.
+
 ## Assertions that wait for a condition
 
 ```flow
@@ -103,7 +116,7 @@ Choose one CSS/Playwright `selector` or accessible `role` with an optional exact
 
 | Conditions | Expected input |
 | --- | --- |
-| `visible`, `hidden`, `attached`, `enabled`, `disabled`, `editable`, `checked`, `empty`, `focused`, `inViewport` | No value |
+| `masked`, `revealed`, `visible`, `hidden`, `attached`, `enabled`, `disabled`, `editable`, `checked`, `empty`, `focused`, `inViewport` | No value |
 | `text`, `containsText`, `value`, `id`, `accessibleName`, `accessibleDescription` | `value`, or `matches` and optional regex `flags` |
 | `values` | Array of selected option values |
 | `count` | Nonnegative integer `value` |

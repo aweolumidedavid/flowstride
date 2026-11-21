@@ -43,12 +43,33 @@ export function catalogPage(cars: Car[], category: string, account?: Account) {
   <p class="count">${cars.length} cars</p><ul class="catalog" aria-label="Cars">${cards}</ul>`, account);
 }
 
+function passwordField(mode: 'login' | 'create-user') {
+  const login = mode === 'login';
+  const id = login ? 'login-password' : 'user-password';
+  const attributes = !login
+    ? 'placeholder="Create a password" autocomplete="new-password" minlength="8" maxlength="128"'
+    : 'placeholder="Enter password" autocomplete="current-password"';
+  return `<div class="password-field">
+      <label for="${id}">${login ? 'Password' : 'Temporary password'}
+        <input id="${id}" name="password" type="password" required ${attributes}>
+      </label>
+      <button type="button" class="password-toggle" aria-controls="${id}" aria-label="Show password" title="Show password" hidden>
+        <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 12s3.7-7 10-7 10 7 10 7-3.7 7-10 7S2 12 2 12Z"/>
+          <circle cx="12" cy="12" r="3"/>
+          <path class="eye-slash" d="m3 3 18 18"/>
+        </svg>
+      </button>
+    </div>
+    <script src="/password-visibility.js" defer></script>`;
+}
+
 export function loginPage(error = '') {
   return layout('Sign in', `<section class="panel narrow"><h1>Sign in</h1>
   ${error ? `<p class="notice" role="alert">${escape(error)}</p>` : ''}
   <form method="post" action="/login">
-    <label>Email <input id="login-email" name="email" type="email" autocomplete="username" required></label>
-    <label>Password <input id="login-password" name="password" type="password" autocomplete="current-password" required></label>
+    <label>Email <input id="login-email" name="email" type="email" placeholder="Enter email" autocomplete="username" required></label>
+    ${passwordField('login')}
     <button>Sign in</button>
   </form></section>`);
 }
@@ -77,9 +98,9 @@ export function adminPage(accounts: Account[], admin: Account, error = '') {
   <div class="admin-layout">
     <section class="panel"><h2>Create a user</h2>
       <form method="post" action="/admin/users">
-        <label>Full name <input id="user-name" name="name" required maxlength="80"></label>
-        <label>User email <input id="user-email" name="email" type="email" required maxlength="150"></label>
-        <label>Temporary password <input id="user-password" name="password" type="password" required minlength="8" maxlength="128" autocomplete="new-password"></label>
+        <label>Full name <input id="user-name" name="name" placeholder="Enter full name" required maxlength="80"></label>
+        <label>User email <input id="user-email" name="email" type="email" placeholder="Enter email" required maxlength="150"></label>
+        ${passwordField('create-user')}
         <button>Create user</button>
       </form>
     </section>

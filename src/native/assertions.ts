@@ -1,3 +1,4 @@
+import { passwordDisplayState } from '../adapters/web/password_toggle';
 import type { WebAdapter } from '../adapters/web/playwright';
 import { readableTargetSchema, readableTargetDescription } from './targeting';
 import { parseBrowserPropertyPath, readBrowserProperty } from './paths';
@@ -21,7 +22,7 @@ async function installAccessibilityNames(page: Page) {
   for (const frame of page.frames()) await frame.evaluate(source);
 }
 const schema = z.object({ target: readableTargetSchema.optional(), message: z.string().min(1).max(1500).optional(), selector: z.string().min(1).optional(), role: z.string().min(1).optional(), name: z.string().optional(), frame: z.string().optional(),
-  condition: z.enum(['visible','hidden','attached','enabled','disabled','editable','checked','empty','focused','text','containsText','value','values','count','attribute','css','id','property','accessibleName','accessibleDescription','inViewport','url','title','localStorage','sessionStorage']),
+  condition: z.enum(['masked','revealed','visible','hidden','attached','enabled','disabled','editable','checked','empty','focused','text','containsText','value','values','count','attribute','css','id','property','accessibleName','accessibleDescription','inViewport','url','title','localStorage','sessionStorage']),
   value: z.unknown().optional(), attribute: z.string().optional(), property: z.string().optional(), key: z.string().optional(),
   matches: z.string().optional(), flags: z.string().regex(/^[imsu]*$/).optional(), not: z.boolean().default(false), timeout: positive.optional(),
 }).strict();
@@ -38,7 +39,8 @@ export async function assertBrowser(page: Page, input: unknown, defaultTimeout: 
   if (!elementCondition && data.target !== undefined) throw new Error('Page/storage assertions do not take an element target.');
   if (data.target !== undefined && !web) throw new Error('Textual assertions require a Flowstride browser adapter.');
   let locator = data.role ? scope.getByRole(data.role as any, { name: data.name, exact: true }) : scope.locator(data.selector || 'body');
-  const booleanConditions = ['visible','hidden','attached','enabled','disabled','editable','checked','empty','focused','inViewport'];
+  const passwordCondition = data.condition === 'masked' || data.condition === 'revealed';
+  const booleanConditions = ['masked','revealed','visible','hidden','attached','enabled','disabled','editable','checked','empty','focused','inViewport'];
   if (!booleanConditions.includes(data.condition) && data.condition !== 'attribute' && expected === undefined) throw new Error('This assertion requires value or matches.');
   if (data.condition === 'attribute' && !data.attribute || ['css','property'].includes(data.condition) && !data.property || ['localStorage','sessionStorage'].includes(data.condition) && !data.key) throw new Error('Assertion requires an attribute, property, or storage key.');
   if (data.condition === 'count' && (!Number.isSafeInteger(expected) || expected < 0)) throw new Error('Count requires a nonnegative integer.');
@@ -56,7 +58,9 @@ export async function assertBrowser(page: Page, input: unknown, defaultTimeout: 
       let sensitive = /password|passcode|token|secret|authorization|cookie|api.?key|otp/i.test([data.key,data.property,data.attribute].filter(Boolean).join(' '));
       try {
         if (elementCondition) {
-          if (data.target !== undefined) locator = await web!.resolveAssertionTarget(data.target, data.frame);
+          if (data.target !== undefined) locator = passwordCondition
+            ? await web!.resolveAssertionTarget(data.target, data.frame, true, undefined, true)
+            : await web!.resolveAssertionTarget(data.target, data.frame);
           count = await locator.count();
           roleCount = data.role && data.name !== undefined && count === 0 ? await scope.getByRole(data.role as any).count() : count;
           if (count === 1 && (['value','values'].includes(data.condition) || data.attribute === 'value' || ['value','defaultValue','textContent','innerHTML','outerHTML'].includes(data.property || ''))) {
@@ -81,6 +85,10 @@ export async function assertBrowser(page: Page, input: unknown, defaultTimeout: 
             case 'disabled':actual=await locator.isDisabled();matched=actual===true;break;
             case 'editable':actual=await locator.isEditable();matched=actual===true;break;
             case 'checked':actual=await locator.isChecked();matched=actual===true;break;
+            case 'masked': case 'revealed':
+              actual = await passwordDisplayState(locator);
+              matched = actual === data.condition;
+              break;
             case 'focused':actual=await locator.evaluate(element=>element===element.ownerDocument.activeElement);matched=actual===true;break;
             case 'empty':actual=await locator.evaluate(element=>(element instanceof HTMLInputElement||element instanceof HTMLTextAreaElement?element.value:element.textContent||'').length===0);matched=actual===true;break;
             case 'text':actual=(await locator.textContent())?.replace(/\s+/g,' ').trim();matched=equals(actual);break;
@@ -117,7 +125,7 @@ export async function assertBrowser(page: Page, input: unknown, defaultTimeout: 
         if(needsSingle&&count!==0)checks.push(count===undefined?{key:'unique',label:'Exactly one matching target',status:'not_evaluated'}:assertionCheck('unique','Exactly one matching target',count===1,1,count));
         else if(needsSingle)checks.push({key:'unique',label:'Exactly one matching target',status:'not_evaluated',reason:absenceAllowed?'A matching element is not required for this condition.':'Target lookup did not find an element.'});
       }
-      const opposites:Record<string,string>={visible:'not visible',hidden:'visible',attached:'absent',enabled:'disabled',disabled:'enabled',editable:'not editable',checked:'unchecked',empty:'not empty',focused:'not focused',inViewport:'outside the viewport'};
+      const opposites:Record<string,string>={masked:'revealed',revealed:'masked',visible:'not visible',hidden:'visible',attached:'absent',enabled:'disabled',disabled:'enabled',editable:'not editable',checked:'unchecked',empty:'not empty',focused:'not focused',inViewport:'outside the viewport'};
       const positiveLabel:Record<string,string>={inViewport:'inside the viewport'};
       const wanted=sensitive?'[REDACTED]':booleanConditions.includes(data.condition)?(data.not?opposites[data.condition]:positiveLabel[data.condition]||data.condition):data.condition==='attribute'&&expected===undefined?'present':`${data.not?'not ':''}${expected instanceof RegExp?expected.toString():diagnosticValue(expected)}`;
       const observed=sensitive?'[REDACTED]':booleanConditions.includes(data.condition)&&typeof actual==='boolean'?(actual?positiveLabel[data.condition]||data.condition:opposites[data.condition]):diagnosticValue(actual);

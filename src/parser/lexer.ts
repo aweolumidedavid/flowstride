@@ -202,6 +202,14 @@ export class Lexer {
         }
 
         const lowerIdent = ident.toLowerCase();
+        if (lowerIdent === 'passtoggle' && /^(?:flow\.)?click$/i.test(tokens.at(-1)?.value ?? '') && this.input[this.position] === '[') {
+          const suffix = /^\[(\d+)\]/.exec(this.input.slice(this.position));
+          if (!suffix || !Number.isSafeInteger(Number(suffix[1]))) throw new SyntaxError(`Line ${this.line}: passToggle index must be a nonnegative safe integer.`);
+          tokens.push({ type: TokenType.IDENTIFIER, value: ident, line: this.line });
+          tokens.push({ type: TokenType.NUMBER, value: suffix[1], line: this.line });
+          this.position += suffix[0].length;
+          continue;
+        }
 
         if (lowerIdent === 'tags' && this.input[this.position] === ':') {
           const start = ++this.position;

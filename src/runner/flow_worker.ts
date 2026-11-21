@@ -73,6 +73,7 @@ export class FlowWorker extends EventEmitter {
   public static readonly nativeHelperProtocol = 1;
   public static readonly nativeFixtureProtocol = 1;
   public static readonly nativeHandoffProtocol = 1;
+  public static readonly nativePasswordToggleProtocol = 1;
   public static readonly nativeApiProtocol = 1;
   public static readonly nativeApplicationEvidenceProtocol = 1;
   private control = new ExecutionControl(
@@ -1975,7 +1976,7 @@ export class FlowWorker extends EventEmitter {
         await this.web.navigate(payload.url);
         break;
       case "click":
-        await this.web.click(payload.selector, payload.elementType);
+        await this.web.click(payload.selector, payload.elementType, payload.toggleIndex);
         break;
       case "hover":
         await this.web.hover(payload.selector, payload.elementType);
