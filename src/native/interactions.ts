@@ -59,13 +59,16 @@ export class NativeInteractions {
   }
 
   private async unique(resolve: () => Promise<Locator>, label: string, scope: ReturnType<NativeInteractions['scope']>): Promise<Locator> {
+    scope.remaining();
     for (;;) {
-      scope.remaining();
       const locator = (await resolve()).filter({ visible: true }), count = await locator.count();
       if (count > 1) throw new Error(`Ambiguous target ${label}: ${count} visible matches. Narrow it with an element qualifier, inside/spatial relationship, or an explicit selector.`);
       if (count === 1) return locator;
-      try { await scope.delay(40); }
-      catch (error) { throw new Error(`Target not found: ${label}; 0 visible matches. Check the readable text, frame, and spatial/container scope. ${String(error instanceof Error ? error.message : error)}`); }
+      try {
+        await scope.delay(40);
+        // The deadline can expire between the delay resolving and this continuation.
+        scope.remaining();
+      } catch (error) { throw new Error(`Target not found: ${label}; 0 visible matches. Check the readable text, frame, and spatial/container scope. ${String(error instanceof Error ? error.message : error)}`); }
     }
   }
 

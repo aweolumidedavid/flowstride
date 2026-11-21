@@ -102,3 +102,21 @@ test('the key allowlist accepts printable characters, physical keys and supporte
  for (const key of supported) assert.equal(validateKey(key), key, key);
  for (const key of ['F13', 'F24', 'Clear', 'Help', 'Super', 'Ctrl', 'Key1', 'Numpad10']) assert.throws(() => validateKey(key));
 });
+
+test('an expired retry reports the last zero-match lookup without issuing another action', async t => {
+  const f = fixture();
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  const count = t.mock.method(f.loc, 'count', async () => 0);
+  const control = {
+    cancelled: () => false,
+    delay: async () => {
+      // Expire after the delay resolves, just before the lookup resumes.
+      queueMicrotask(() => queueMicrotask(() => { now = 100; }));
+    },
+  };
+  const runtime = new NativeInteractions(f.web, { timeout: 100 }, control);
+  await assert.rejects(runtime.simple('clear', { selector: 'Missing' }), /Missing.*0 visible matches.*100 ms/);
+  assert.equal(count.mock.callCount(), 1);
+  assert.deepEqual(f.calls, []);
+});
